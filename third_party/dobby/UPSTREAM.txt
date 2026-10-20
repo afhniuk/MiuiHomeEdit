@@ -1,0 +1,15 @@
+Dobby
+======
+
+Upstream: https://github.com/jmpews/Dobby
+Pinned commit: 5dfc8546954ce3b3198132ab13fddb89ee92cdd7
+Archive: https://codeload.github.com/jmpews/Dobby/zip/5dfc8546954ce3b3198132ab13fddb89ee92cdd7
+License: Apache License 2.0 (see LICENSE)
+
+Vendored subset: cmake/, common/, external/, include/, source/,
+builtin-plugin/, CMakeLists.txt, README.md and LICENSE. The examples, tests,
+docs, scripts and CI configuration are not part of this checkout.
+
+Local integration details are in app/src/main/cpp/CMakeLists.txt: only the
+dobby_static target is linked, Plugin.SymbolResolver is disabled, and the
+shared libdobby target is excluded from the default build.

@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">MiuiHomeEdit</string>
+    <!-- Shown by the module manager as the module description. -->
+    <string name="module_description">Native hooks for the HyperOS launcher (com.miui.home). Requires a libxposed API 101+ framework.</string>
+</resources>

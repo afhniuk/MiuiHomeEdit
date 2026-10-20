@@ -1,0 +1,18 @@
+[versions]
+agp = "9.4.1"
+junit = "4.13.2"
+junitVersion = "1.1.5"
+espressoCore = "3.5.1"
+# Modern Xposed API (libxposed). 102.0.0 is compiled for Java 21 (class file 65).
+libxposed = "102.0.0"
+
+[libraries]
+# compileOnly: the framework supplies these classes at runtime. Never package them.
+libxposed-api = { group = "io.github.libxposed", name = "api", version.ref = "libxposed" }
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+androidx-junit = { group = "androidx.test.ext", name = "junit", version.ref = "junitVersion" }
+androidx-espresso-core = { group = "androidx.test.espresso", name = "espresso-core", version.ref = "espressoCore" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+

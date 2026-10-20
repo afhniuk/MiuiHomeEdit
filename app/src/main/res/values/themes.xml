@@ -1,0 +1,8 @@
+<resources>
+    <!--
+        The control panel uses a platform theme and depends on no
+        AndroidX/Material library, which keeps the APK free of an extra UI
+        dependency just for six switches.
+    -->
+    <style name="Theme.MiuiHomeEdit" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>
