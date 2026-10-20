@@ -661,7 +661,6 @@ std::uint32_t ScanHeapForAllCategoryList(std::uintptr_t heap_base,
 // shifts _TabBarViewState's cached children list.
 extern "C" __attribute__((used)) std::uintptr_t PruneDrawerAllTab(void *,
                                                                  void *self) {
-    config::MaybeReload();
     static std::atomic<int> g_build_calls{0};
     const int call = g_build_calls.fetch_add(1, std::memory_order_relaxed);
     const bool enabled = config::IsEnabled(config::Feature::kHideDrawerAllTab);
@@ -771,7 +770,6 @@ extern "C" __attribute__((used)) std::uintptr_t PruneDrawerAllTab(void *,
 // entries, which leaves page 0 showing "All". Shift it in place as well.
 extern "C" __attribute__((used)) std::uintptr_t MutateTabBarViewChildren(
     void *, void *self) {
-    config::MaybeReload();
     if (!config::IsEnabled(config::Feature::kHideDrawerAllTab)) {
         return 0;
     }
@@ -881,7 +879,6 @@ extern "C" __attribute__((used)) std::uintptr_t MutateTabBarViewChildren(
 
 /** Shared body of the four widget hooks: swap in SizedBox.shrink() when on. */
 std::uintptr_t DecideEmptyWidget(config::Feature feature) {
-    config::MaybeReload();
     if (!config::IsEnabled(feature)) {
         return 0;
     }
@@ -893,7 +890,6 @@ extern "C" __attribute__((used)) std::uintptr_t DecideEditButton() {
 }
 
 extern "C" __attribute__((used)) std::uintptr_t DecideSettingsGear() {
-    config::MaybeReload();
     const bool enabled =
         config::IsEnabled(config::Feature::kHideSettingsGear);
     const std::uintptr_t empty = enabled ? GetEmptyWidget() : 0;
@@ -917,7 +913,6 @@ extern "C" __attribute__((used)) std::uintptr_t DecideSearchBox() {
  * layout. GetFalse() caches it, so the cost is paid once.
  */
 extern "C" __attribute__((used)) std::uintptr_t DecideSwipeUpArrow() {
-    config::MaybeReload();
     const bool enabled =
         config::IsEnabled(config::Feature::kHideSwipeUpArrow);
     const std::uintptr_t value = enabled ? GetFalse() : 0;

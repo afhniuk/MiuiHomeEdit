@@ -457,9 +457,11 @@ NativeOnModuleLoaded native_init(const NativeAPIEntries *entries) {
     }
 
     // Read /sdcard/Android/data/com.miui.home/files/miuihome_edit.json (or one
-    // of the fallbacks listed in module_config.cpp) before installing anything.
-    // A missing/corrupt file leaves all six switches off; the hook wrappers
-    // re-check the file lazily, so the control panel can be used afterwards.
+    // of the fallbacks listed in module_config.cpp) exactly once, before
+    // installing anything. The bits are latched for the rest of this process:
+    // a later panel change, missing file or corrupt rewrite must never toggle
+    // an already-running hook. The panel's new selection is picked up on the
+    // next launcher start.
     miuihome::config::Initialize();
 
     // Late injection: libapp.so may already be mapped, in which case no dlopen

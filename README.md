@@ -119,12 +119,12 @@ AGP 会输出 `app/build/outputs/apk/release/app-release-unsigned.apk`。该 APK
 
 ## 控制面板
 
-安装并打开 `MiuiHomeEdit`。五个开关互相独立，默认全部关闭；每次切换都会立即保存：
+安装并打开 `MiuiHomeEdit`。五个开关互相独立，默认全部关闭。每次切换都会立即持久化保存，但 native 只在 `com.miui.home` 启动时读取一次；因此开关变更要重启桌面才生效，并且在该桌面进程结束前始终使用同一份启动快照：
 
 1. `ConfigStore` 先把 JSON 原子写入模块自己的 `filesDir`。
 2. 有 Root 时，通过 `su` 执行一段 POSIX `sh` 脚本，把文件复制到 `com.miui.home` 的设备加密 `files` 目录（`/data/user_de/<user>/...`）、CE 私有 `files` 目录和外部 `files` 目录，并 `chown` 到桌面 UID；同时刷新 `/storage/emulated/<user>/MiuiHomeEdit/`。写入使用“临时文件 + `mv`”，启动器不会读到写了一半的 JSON。设备加密目录在开机解锁前就可读，因此冷启动早期也能拿到开关。
 3. 没有 Root 时，在获得“所有文件访问”权限后尝试写公共目录 `MiuiHomeEdit`；该回退路径可能无法被桌面读取，面板状态区会明确提示。
-4. 面板不会自动强制停止桌面；单独的“重启 com.miui.home”按钮执行 `am force-stop --user <桌面用户> com.miui.home`。
+4. 面板不会自动强制停止桌面；单独的“重启 com.miui.home”按钮执行 `am force-stop --user <桌面用户> com.miui.home`。**保存开关不会热更新正在运行的桌面**：只有桌面进程重新启动后，native 才会读取新 JSON 并锁存为本次进程的配置快照。
 
 配置文件名为 `miuihome_edit.json`：
 
@@ -153,7 +153,9 @@ AGP 会输出 `app/build/outputs/apk/release/app-release-unsigned.apk`。该 APK
 
 在 HyperOS 4 + KernelSU 上，Root 域名可能看不到桌面的 `app_data_file` 目录，因此 Root 脚本写 DE/CE 私有路径会失败。桌面进程本身有权限，所以 native 在读到任一有效配置后，会把同一份 JSON **自行写回** `/data/user_de/<user>/com.miui.home/files/miuihome_edit.json`；下一次冷启动优先读取它。日志中的 `config: persisted ...` 表示这一步成功。
 
-hook 每两秒最多调用一次 `MaybeReload()`。任一候选文件的 inode、大小或 mtime 变化都会触发重新读取，因此配置本身不需要重启进程即可生效；但如果某个 Dart Widget 或 predicate 已经用旧值构建完成，仍需重启桌面才能看到界面变化。
+`module_config.cpp` 在 `native_init`（以及 `Install()` 的幂等复查）中读取**一次**配置，把五个功能位锁存到进程内原子变量。之后即使面板改写、删除或短暂无法读取任何一个候选文件，运行中的桌面也不会重新读取：hook 始终使用启动时的快照，直到 `com.miui.home` 进程退出。下一次进程启动才会读取最新 JSON，再次锁存。这个“作用域启动时生效、重启前保持不变”的模型与 HyperCeiler 的配置生效方式一致。
+
+启动时如果所有候选都不可读、JSON 损坏或没有任何有效文件，本次进程内五个功能全部关闭；请确认配置写入路径后重启桌面，而不是在运行中反复切换开关。日志中的 `config: snapshot selected ...` 表示快照已锁定，`config: process snapshot latched; changes need a launcher restart` 表示本进程之后不会再读取配置。
 
 ## 日志与诊断
 
@@ -221,8 +223,9 @@ adb shell su -c "tail -n 300 /data/user/0/com.miui.home/files/miuihome_edit.log"
 | 有 `constructed`，没有 `native_init` | `.so` 没有映射：检查 APK 的 `lib/arm64-v8a/`、`native_init.list`、`extractNativeLibs=false` |
 | `native_init ... (target)` 和两个镜像基址都有 | 注入成功；继续看下一行 |
 | `no target offsets configured` | 所有目标都是 `kUnset`：当前是未填写目标段的构建，开关不会生效 |
-| `config: selected ... bits=...` | 配置已读到；若界面仍无变化，问题在 hook 目标或该 Widget 已构建完成 |
-| `config: selected /data/user_de/...` | 冷启动早期从设备加密目录读到配置；这是开机即生效的预期路径 |
+| `config: snapshot selected ... bits=...` | 启动配置已锁定；若界面仍无变化，问题在 hook 目标或该 Widget 的构建时机 |
+| `config: snapshot selected /data/user_de/...` | 冷启动早期从设备加密目录读到配置；这是开机即生效的预期路径 |
+| `config: process snapshot latched` | 本进程已锁定配置；面板之后的修改不会再影响当前桌面，直到下次重启 |
 | `drawer-tabbar-view: shifted children from 9 to 8` | TabBarView 缓存的页面 children 已同步左移，首屏应为第一个自定义分类；这是当前修复错位的决定性日志 |
 | `drawer-all-tab: pruning class=92 len=9` | 标签栏列表仍以“全部”开头，开始堆扫描并修剪；随后应出现 `pruned ... to 8 entries` 和 `list now len=8` |
 | `drawer-all-tab: tabbar ... list=... len=9` | 标签栏每次构建看到的共享列表；`len=0` 是尚未填充的副本，`len=9` 表示仍含“全部”并会触发修剪 |
@@ -385,7 +388,8 @@ diag: process=com.miui.home ... runtime api=37 ...
 native_init: framework API v2, process 'com.miui.home' (target)
 config: candidate /data/user_de/0/com.miui.home/files/miuihome_edit.json: ... 
 config: candidate /data/user/0/com.miui.home/files/miuihome_edit.json: ...
-config: selected /data/user_de/0/com.miui.home/files/miuihome_edit.json (bits=0x...)
+config: snapshot selected /data/user_de/0/com.miui.home/files/miuihome_edit.json (bits=0x...)
+config: process snapshot latched; changes need a launcher restart
 images (native_init): 1 engine image(s) listed above
 image: <apk path>!/lib/arm64-v8a/libapp.so base=0x...
 libapp.so mapped (base=0x..., reason=native_init)

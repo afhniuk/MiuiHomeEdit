@@ -18,7 +18,7 @@ import java.util.concurrent.TimeUnit
 import java.util.zip.ZipFile
 
 /**
- * Persists the six switches and copies the document to a path the launcher can
+ * Persists the five switches and copies the document to a path the launcher can
  * read.
  *
  * Android 11+ scoped storage makes another app's Android/data directory
@@ -63,6 +63,9 @@ object ConfigStore {
                     else -> "没有写入桌面可读取的路径。\n"
                 },
             )
+            if (reliableTargetPath) {
+                append("重启 com.miui.home 后新配置才会生效；重启前当前桌面进程保持启动时锁定的配置。\n")
+            }
             append("Root：").append(if (rootAvailable) "可用" else "不可用或未授权").append('\n')
             append("桌面私有目录：").append(ok(privateOk)).append('\n')
             append("桌面设备加密目录：").append(ok(deviceOk)).append('\n')
@@ -622,20 +625,20 @@ object ConfigStore {
             }
         }
         if (text.contains("no target offsets configured")) {
-            findings += "根因：dart_hooks.cpp 中六个 hook 目标仍是 kUnset。模块已加载、" +
-                "配置也可能已读取，但没有任何代码被 hook，所以六个开关都不会改变界面。"
+            findings += "根因：dart_hooks.cpp 中所有 hook 目标仍是 kUnset。模块已加载、" +
+                "配置也可能已读取，但没有任何代码被 hook，所以开关都不会改变界面。"
         }
-        val configBits = Regex("config: selected .* \\(bits=0x([0-9a-fA-F]+)\\)")
+        val configBits = Regex("config: (?:snapshot )?selected .* \\(bits=0x([0-9a-fA-F]+)\\)")
             .find(text)
             ?.groupValues
             ?.getOrNull(1)
             ?.toLongOrNull(16)
-        if (text.contains("config: selected")) {
-            findings += "桌面进程已成功读取配置文件；若仍有开关无效，问题在 hook 目标，而不是写入路径。"
-            if (configBits != null && configBits == 0L) {
-                findings += "配置已读到，但六个功能位全部为 0：检查开关写入的 JSON 键名，" +
+        if (configBits != null) {
+            findings += "桌面进程已成功锁定启动配置快照；若仍有开关无效，问题在 hook 目标，而不是写入路径。"
+            if (configBits == 0L) {
+                findings += "配置已读到，但五个功能位全部为 0：检查开关写入的 JSON 键名，" +
                     "或保存后是否只更新了旧文件。"
-            } else if (configBits != null) {
+            } else {
                 findings += "配置已读到，启用位掩码=0x${configBits.toString(16)}。"
             }
         }

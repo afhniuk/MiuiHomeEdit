@@ -25,22 +25,21 @@ enum class Feature : std::uint32_t {
 };
 
 /**
- * Reads the newest valid configuration file and publishes its bits.
+ * Reads the newest valid configuration file and latches its bits for the rest
+ * of this launcher process.
  *
- * Safe to call more than once and from any thread. Called from native_init()
- * before the Dart hooks are installed, and again lazily if a hook runs before
- * the first explicit call.
+ * Safe to call more than once and from any thread. The first call wins; later
+ * calls are cheap no-ops. Called from native_init() before the Dart hooks are
+ * installed, and again from Install() only to make that ordering explicit.
+ *
+ * Deliberately not polled afterwards: a control-panel change is persisted to
+ * disk immediately but must not affect a running launcher. This keeps every
+ * hook reading one immutable snapshot, so a transient missing/unreadable
+ * config file cannot make hidden widgets reappear mid-session.
  */
 void Initialize();
 
-/**
- * Cheap, rate-limited reload check. Call this at the top of a hook wrapper:
- * it performs at most one stat() pass over the candidate paths every two
- * seconds and re-reads the JSON only when a file's size/mtime/inode changed.
- */
-void MaybeReload();
-
-/** Returns the currently published value. Missing keys are false. */
+/** Returns the value latched at process start. Missing keys are false. */
 bool IsEnabled(Feature feature) noexcept;
 
 /** True when at least one of the five switches is on. */

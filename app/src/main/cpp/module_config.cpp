@@ -17,6 +17,11 @@
  * it only publishes the five known booleans. It is deliberately exception-free
  * (the module is compiled with -fno-exceptions) and bounded in file size and
  * nesting depth.
+ *
+ * The document is read exactly once per launcher process. After Initialize()
+ * publishes the bits, this translation unit never stats or reads a candidate
+ * again: the panel's newer values only take effect when com.miui.home is
+ * restarted. See module_config.h for why that latch is intentional.
  */
 
 #include "module_config.h"
@@ -27,7 +32,6 @@
 
 #include <atomic>
 #include <cerrno>
-#include <chrono>
 #include <cstdarg>
 #include <cstddef>
 #include <cstdint>
@@ -45,7 +49,6 @@ namespace {
 
 constexpr std::size_t kMaxConfigBytes = 64u * 1024u;
 constexpr int kMaxJsonDepth = 8;
-constexpr auto kReloadInterval = std::chrono::seconds(2);
 
 constexpr std::uint32_t Bit(Feature feature) noexcept {
     return static_cast<std::uint32_t>(feature);
@@ -53,19 +56,7 @@ constexpr std::uint32_t Bit(Feature feature) noexcept {
 
 std::atomic<std::uint32_t> g_bits{0};
 std::atomic<bool> g_initialized{false};
-std::atomic<std::int64_t> g_next_check_ns{0};
-std::atomic<std::uint64_t> g_signature{0};
 std::mutex g_mutex;
-
-// Guarded by g_mutex. Used to avoid logging the same successful source and
-// values on every reload.
-std::string g_source;
-
-std::int64_t NowNs() {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-               std::chrono::steady_clock::now().time_since_epoch())
-        .count();
-}
 
 void AddPath(std::vector<std::string> *paths, const char *format, ...)
     __attribute__((format(printf, 2, 3)));
@@ -528,35 +519,6 @@ bool ParseConfig(std::string_view text, std::uint32_t *bits) {
     return parser.Parse(bits);
 }
 
-std::uint64_t HashValue(std::uint64_t hash, std::uint64_t value) {
-    hash ^= value + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
-    return hash;
-}
-
-/**
- * Changes whenever a candidate file is created, removed or modified. mtime is
- * included at nanosecond resolution because the control panel may replace two
- * equally sized documents within the same second.
- */
-std::uint64_t ComputeSignature(const std::vector<std::string> &paths) {
-    std::uint64_t hash = 1469598103934665603ULL;
-    for (const std::string &path : paths) {
-        struct stat info = {};
-        if (stat(path.c_str(), &info) == 0) {
-            hash = HashValue(hash, 1);
-            hash = HashValue(
-                hash, static_cast<std::uint64_t>(info.st_mtim.tv_sec));
-            hash = HashValue(
-                hash, static_cast<std::uint64_t>(info.st_mtim.tv_nsec));
-            hash = HashValue(hash, static_cast<std::uint64_t>(info.st_size));
-            hash = HashValue(hash, static_cast<std::uint64_t>(info.st_ino));
-        } else {
-            hash = HashValue(hash, 0);
-        }
-    }
-    return hash;
-}
-
 void LogBits(std::uint32_t bits) {
     LOGI("config: drawer-all-tab=%d edit-button=%d settings-gear=%d "
          "search-box=%d swipe-up-arrow=%d",
@@ -671,9 +633,8 @@ bool PersistDeviceEncrypted(const std::vector<std::string> &paths,
     return true;
 }
 
-/** Called with g_mutex held. */
-void LoadLocked(const std::vector<std::string> &paths,
-                std::uint64_t signature) {
+/** Called with g_mutex held and captures the process-lifetime snapshot. */
+void LoadLocked(const std::vector<std::string> &paths) {
     std::uint32_t bits = 0;
     std::string source;
     std::string selected_text;
@@ -710,15 +671,11 @@ void LoadLocked(const std::vector<std::string> &paths,
         }
     }
 
-    const std::uint32_t previous =
-        g_bits.exchange(bits, std::memory_order_acq_rel);
-    g_signature.store(signature, std::memory_order_release);
+    g_bits.store(bits, std::memory_order_release);
 
     if (!found) {
-        if (!g_source.empty() || previous != 0) {
-            LOGW("config: no readable config file; all features off");
-        }
-        g_source.clear();
+        LOGW("config: no readable config file; all features off for this "
+             "launcher process");
         return;
     }
 
@@ -726,11 +683,8 @@ void LoadLocked(const std::vector<std::string> &paths,
         PersistDeviceEncrypted(paths, source, selected_text);
     }
 
-    if (previous != bits || source != g_source) {
-        g_source = source;
-        LOGI("config: selected %s (bits=0x%08x)", source.c_str(), bits);
-        LogBits(bits);
-    }
+    LOGI("config: snapshot selected %s (bits=0x%08x)", source.c_str(), bits);
+    LogBits(bits);
 }
 
 }  // namespace
@@ -746,47 +700,14 @@ void Initialize() {
 
     const std::vector<std::string> paths = CandidatePaths();
     LogCandidateStatus(paths);
-    LoadLocked(paths, ComputeSignature(paths));
+    // This is the only read of the configuration in this process. The bits
+    // are never refreshed afterwards, even if a candidate file changes, is
+    // replaced or disappears. That is the persistence contract: the panel's
+    // selection becomes active at the next launcher start and stays active
+    // until the process itself exits.
+    LoadLocked(paths);
     g_initialized.store(true, std::memory_order_release);
-    g_next_check_ns.store(
-        NowNs() +
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                kReloadInterval)
-                .count(),
-        std::memory_order_relaxed);
-}
-
-void MaybeReload() {
-    if (!g_initialized.load(std::memory_order_acquire)) {
-        Initialize();
-        return;
-    }
-
-    const std::int64_t now = NowNs();
-    std::int64_t next = g_next_check_ns.load(std::memory_order_relaxed);
-    if (now < next) {
-        return;
-    }
-
-    const std::int64_t new_next =
-        now + std::chrono::duration_cast<std::chrono::nanoseconds>(
-                  kReloadInterval)
-                  .count();
-    if (!g_next_check_ns.compare_exchange_strong(
-            next, new_next, std::memory_order_relaxed)) {
-        return;
-    }
-
-    const std::vector<std::string> paths = CandidatePaths();
-    const std::uint64_t signature = ComputeSignature(paths);
-    if (signature == g_signature.load(std::memory_order_acquire)) {
-        return;
-    }
-
-    std::lock_guard<std::mutex> lock(g_mutex);
-    if (signature != g_signature.load(std::memory_order_relaxed)) {
-        LoadLocked(paths, signature);
-    }
+    LOGI("config: process snapshot latched; changes need a launcher restart");
 }
 
 bool IsEnabled(Feature feature) noexcept {

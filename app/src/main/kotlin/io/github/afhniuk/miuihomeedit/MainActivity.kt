@@ -19,8 +19,13 @@ import android.widget.TextView
 import java.io.File
 
 /**
- * Six independent switches. The panel talks to the native module only through
- * the JSON file; it never tries to bind to the launcher process.
+ * The five independent switches. The panel talks to the native module only
+ * through the JSON file; it never tries to bind to the launcher process.
+ *
+ * A change is persisted immediately, but the native side reads the document
+ * exactly once when com.miui.home starts. Until that process is restarted, the
+ * already-latched selection keeps applying; after the restart the new JSON is
+ * latched for the whole next session.
  *
  * The panel is intentionally Chinese-only, so the labels are kept inline rather
  * than duplicated in strings.xml; the lint I18N check is not useful here.
@@ -44,7 +49,8 @@ class MainActivity : Activity() {
         config = ConfigStore.loadLocal(this)
         setContentView(buildUi())
         refreshTargetState()
-        statusView.text = "开关默认全部关闭。打开一个开关会立即保存，并在约 2 秒内被 com.miui.home 读取。" +
+        statusView.text = "开关默认全部关闭。打开一个开关会立即持久化保存，但不会热更新当前桌面进程；" +
+            "下一次重启 com.miui.home 时才会读取新配置，并在该进程结束前一直保持这份启动快照。" +
             "若桌面已重启仍无变化，请点“收集诊断日志”；日志若提示 no target offsets，说明当前构建的 hook 目标尚未配置；若提示模块未加载，请确认使用支持 API 101+ 的 Vector（LSPosed 1.9.x 不支持本模块）。"
     }
 
@@ -69,7 +75,7 @@ class MainActivity : Activity() {
             setTypeface(typeface, Typeface.BOLD)
         })
         root.addView(TextView(this).apply {
-            text = "五个开关互相独立，默认关闭。每次切换都会原子写入 JSON。"
+            text = "五个开关互相独立，默认关闭。切换后会原子写入 JSON；重启桌面后整份配置生效，并在该桌面进程内保持不变。"
             textSize = 14f
             setTextColor(Color.rgb(96, 102, 112))
             setPadding(0, dp(6), 0, dp(12))
@@ -238,7 +244,7 @@ class MainActivity : Activity() {
         }
         saving = true
         setControlsEnabled(false)
-        statusView.text = "正在保存并写入 com.miui.home 可读取的路径…"
+        statusView.text = "正在保存并写入 com.miui.home 可读取的路径…\n保存后需重启桌面才会应用；当前桌面进程会继续使用启动时的配置快照。"
         val snapshot = config
         Thread {
             val report = ConfigStore.save(this@MainActivity, snapshot)

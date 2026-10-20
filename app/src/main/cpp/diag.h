@@ -44,7 +44,7 @@ void DumpEnvironment();
 void DumpImage(const aot::Image& image, const char* name);
 
 /**
- * One-shot static probe for the strings that identify the six UI features.
+ * One-shot static probe for the strings that identify the five UI features.
  *
  * For each anchor this logs the raw hit address, the containing image offset,
  * a plausible Dart string object header (class id and length) and any 8-byte
