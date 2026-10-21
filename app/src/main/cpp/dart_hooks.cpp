@@ -48,6 +48,8 @@
 #include <cstring>
 
 #include <atomic>
+#include <cerrno>
+#include <mutex>
 
 #include "log.h"
 #include "module_config.h"
@@ -90,6 +92,34 @@ std::atomic<std::uint32_t> g_pruned_category_length{0};
 namespace {
 
 constexpr std::uintptr_t kUnset = 0;
+
+// Dobby's arm64 entry patch is 16 bytes. The health monitor compares these
+// bytes against the live code page; see EnsureHealthy().
+constexpr std::size_t kPatchSize = 16;
+constexpr std::size_t kMaxInstalledHooks = 8;
+
+/**
+ * State of one successfully installed inline hook.
+ *
+ * |original| is the untouched 16-byte prologue, |patch| is what Dobby wrote.
+ * Both are captured at install time. A memory-pressure event can evict the
+ * modified, APK-backed code page and re-fault the original bytes from
+ * MiuiHome.apk, which silently removes every hook; the monitor detects that
+ * transition (live == original) and writes |patch| back. It never guesses:
+ * anything that is neither |original| nor |patch| is left untouched.
+ */
+struct InstalledPatch {
+    const char *name = nullptr;
+    std::uintptr_t target = 0;
+    std::uint8_t original[kPatchSize] = {};
+    std::uint8_t patch[kPatchSize] = {};
+    bool installed = false;
+};
+
+InstalledPatch g_patches[kMaxInstalledHooks];
+std::size_t g_patch_count = 0;
+std::atomic<std::uintptr_t> g_installed_image_base{0};
+std::mutex g_install_mutex;
 
 // Dart tagged-pointer layout (64-bit): Smi is value << 1, a heap object is
 // address | 1. The class id lives in bits 12..31 of the object header.
@@ -163,7 +193,11 @@ constexpr std::uintptr_t kSwipeUpArrowWidget = 0x117735c;
 // though it was found in one function.
 constexpr std::uintptr_t kEmptyWidgetPoolOffset = 0x6250;
 constexpr std::uintptr_t kEmptyWidgetObjectVaddr = kUnset;
-constexpr std::uint32_t kEmptyWidgetClassId = 0;
+// `_SizedBox` on RELEASE-8.01.02.7719; the hook logs the resolved class id at
+// startup. The id also lets GetEmptyWidget() notice that the cached pool object
+// was invalidated (for example because the Flutter engine restarted its
+// isolate) and resolve the new object instead of returning a stale pointer.
+constexpr std::uint32_t kEmptyWidgetClassId = 7713;
 
 // `false` is derived from x22 on the Dart thread (NullObject + 0x30); see
 // GetFalse() below. No pool or image object is needed.
@@ -438,7 +472,21 @@ std::uintptr_t ResolveFromPool(std::uintptr_t pool_offset,
 std::uintptr_t GetEmptyWidget() {
     std::uintptr_t value = g_empty_widget.load(std::memory_order_acquire);
     if (value != 0) {
-        return value;
+        // Revalidate every time: a Flutter engine restart creates a new isolate
+        // and a new global object pool, so the cached pointer would otherwise
+        // become the only surviving reference to a dead object. A class-id
+        // mismatch is cheap to detect and lets the hook resolve the new pool
+        // entry instead of returning garbage. Widget builders run on rebuilds,
+        // not per frame, so the maps lookup is not on a hot path.
+        if (IsUsableObject(value, target::kEmptyWidgetClassId, false, nullptr)) {
+            return value;
+        }
+        LOGW("empty widget: cached object %p is no longer a usable SizedBox; "
+             "re-resolving",
+             reinterpret_cast<void *>(value));
+        g_empty_widget.store(0, std::memory_order_release);
+        g_empty_widget_lookup_failed.store(false, std::memory_order_relaxed);
+        value = 0;
     }
     if (g_empty_widget_lookup_failed.load(std::memory_order_relaxed)) {
         return 0;
@@ -454,20 +502,22 @@ std::uintptr_t GetEmptyWidget() {
 }
 
 std::uintptr_t GetFalse() {
-    std::uintptr_t value = g_false.load(std::memory_order_acquire);
-    if (value != 0) {
-        return value;
-    }
-    // The canonical Bool.false is NullObject+0x30. Deriving it from x22 needs
-    // no pool slot, no image address and no class-id guess.
-    value = GetDartFalse();
+    // Do not cache: x22 (NullObject) belongs to the current isolate. A cached
+    // pointer would be stale after the engine restarts its isolate even when
+    // libapp.so keeps the same load bias. The derivation is a single `add`.
+    const std::uintptr_t value = GetDartFalse();
     if (value == 0) {
-        LOGW("false: x22 is zero; not a Dart thread");
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true, std::memory_order_relaxed)) {
+            LOGW("false: x22 is zero; not a Dart thread");
+        }
         return 0;
     }
-    g_false.store(value, std::memory_order_release);
-    LOGI("false: using canonical Bool.false at %p (NullObject+0x30)",
-         reinterpret_cast<void *>(value));
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed)) {
+        LOGI("false: using canonical Bool.false at %p (NullObject+0x30)",
+             reinterpret_cast<void *>(value));
+    }
     return value;
 }
 
@@ -833,13 +883,12 @@ extern "C" __attribute__((used)) std::uintptr_t MutateTabBarViewChildren(
     if (pruned_length != 0 && length <= pruned_length) {
         return 0;
     }
-    static std::uintptr_t shifted[32] = {};
-    static std::uint32_t shifted_count = 0;
-    for (std::uint32_t i = 0; i < shifted_count; ++i) {
-        if (shifted[i] == list) {
-            return 0;
-        }
-    }
+    // Rely on the list's own length, not on a cache of previously shifted
+    // pointers. Dart's GC frees the old page lists and reuses their addresses
+    // for new ones; a pointer cache would eventually mistake a fresh 9-entry
+    // list for an already-shifted one and leave the "All" page visible. After
+    // the memmove below, the same list has length N-1, so the guard above is
+    // sufficient to make the operation idempotent.
     const std::uint32_t remaining = length - 1;
     std::memmove(reinterpret_cast<void *>(data_raw + 0x10),
                  reinterpret_cast<const void *>(data_raw + 0x14),
@@ -848,9 +897,6 @@ extern "C" __attribute__((used)) std::uintptr_t MutateTabBarViewChildren(
     std::memcpy(reinterpret_cast<void *>(list_raw + 0x0c), &new_length_smi,
                 sizeof(new_length_smi));
     g_pruned_category_length.store(remaining, std::memory_order_relaxed);
-    if (shifted_count < 32) {
-        shifted[shifted_count++] = list;
-    }
     LOGI("drawer-tabbar-view: shifted children from %u to %u", length,
          remaining);
     return 0;
@@ -1055,7 +1101,13 @@ bool HasSafePatchWindow(const aot::Span &text, std::uintptr_t address) {
     return true;
 }
 
-MIUIHOME_RETAIN bool InstallOne(const HookSpec &spec, const aot::Span &text) {
+MIUIHOME_RETAIN bool InstallOne(const HookSpec &spec, const aot::Span &text,
+                                InstalledPatch *record) {
+    if (record != nullptr) {
+        record->name = spec.name;
+        record->target = 0;
+        record->installed = false;
+    }
     if (spec.target == kUnset) {
         LOGW("%s: target offset not configured; not hooking", spec.name);
         return false;
@@ -1070,6 +1122,14 @@ MIUIHOME_RETAIN bool InstallOne(const HookSpec &spec, const aot::Span &text) {
         LOGE("%s: target %p is not a safe 16-byte hook site", spec.name,
              reinterpret_cast<void *>(address));
         return false;
+    }
+
+    // Snapshot the prologue before Dobby rewrites it. EnsureHealthy() uses
+    // these bytes to tell "Dobby's patch is still there" from "the page was
+    // re-faulted from the APK and the hook is gone".
+    if (record != nullptr) {
+        std::memcpy(record->original, reinterpret_cast<const void *>(address),
+                    kPatchSize);
     }
 
     void *original = nullptr;
@@ -1088,14 +1148,62 @@ MIUIHOME_RETAIN bool InstallOne(const HookSpec &spec, const aot::Span &text) {
     if (spec.origin != nullptr) {
         *spec.origin = original;
     }
+    if (record != nullptr) {
+        record->target = address;
+        std::memcpy(record->patch, reinterpret_cast<const void *>(address),
+                    kPatchSize);
+        record->installed = true;
+    }
     LOGI("hooked %s at %p (original %p)", spec.name,
          reinterpret_cast<void *>(address), original);
     return true;
 }
 
+/**
+ * Re-applies a previously captured Dobby patch. The target is an executable
+ * page of libapp.so; it is switched to RWX only for the 16-byte store and then
+ * back to RX. This is not a new hook: the trampoline and the |g_origin_*|
+ * pointer captured at install time stay valid.
+ */
+bool WriteCodeBytes(std::uintptr_t address, const std::uint8_t *bytes,
+                    std::size_t size) {
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0 || address == 0 || bytes == nullptr || size == 0) {
+        return false;
+    }
+    const std::uintptr_t mask = static_cast<std::uintptr_t>(page_size) - 1;
+    const std::uintptr_t begin = address & ~mask;
+    const std::uintptr_t end = (address + size + mask) & ~mask;
+    if (mprotect(reinterpret_cast<void *>(begin), end - begin,
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        LOGW("health: mprotect(%p, %zu) failed: %s (errno=%d)",
+             reinterpret_cast<void *>(begin), end - begin, std::strerror(errno),
+             errno);
+        return false;
+    }
+    std::memcpy(reinterpret_cast<void *>(address), bytes, size);
+    __builtin___clear_cache(reinterpret_cast<char *>(address),
+                            reinterpret_cast<char *>(address + size));
+    if (mprotect(reinterpret_cast<void *>(begin), end - begin,
+                 PROT_READ | PROT_EXEC) != 0) {
+        LOGW("health: restoring RX on %p failed: %s (errno=%d)",
+             reinterpret_cast<void *>(begin), std::strerror(errno), errno);
+        return false;
+    }
+    return true;
+}
+
+/** Drops everything that belongs to the current Dart isolate. */
+void ResetRuntimeCaches() {
+    g_empty_widget.store(0, std::memory_order_release);
+    g_empty_widget_lookup_failed.store(false, std::memory_order_relaxed);
+    g_false.store(0, std::memory_order_release);
+    g_pruned_category_length.store(0, std::memory_order_relaxed);
+}
+
 }  // namespace
 
-void Install(const aot::Image &image) {
+void InstallLocked(const aot::Image &image) {
 #if !defined(__aarch64__)
     // The launcher's Dart AOT is arm64. The module still builds for armv7, but
     // these hooks are not installed there.
@@ -1107,6 +1215,9 @@ void Install(const aot::Image &image) {
         return;
     }
     g_image = image;
+    g_installed_image_base.store(image.base, std::memory_order_release);
+    g_patch_count = 0;
+    ResetRuntimeCaches();
 
     // native_init() already did this; the call is idempotent and keeps the
     // hook path usable if Install() is reached through another future entry.
@@ -1167,7 +1278,116 @@ void Install(const aot::Image &image) {
         }
         // The bool hook needs no configured object: GetFalse() derives the
         // canonical Bool.false from x22 (NullObject+0x30) on the Dart thread.
-        InstallOne(spec, text);
+        InstalledPatch *record = nullptr;
+        if (g_patch_count < kMaxInstalledHooks) {
+            record = &g_patches[g_patch_count++];
+        }
+        InstallOne(spec, text, record);
+    }
+#endif
+}
+
+void Install(const aot::Image &image) {
+    std::lock_guard<std::mutex> lock(g_install_mutex);
+    InstallLocked(image);
+}
+
+/**
+ * Periodic integrity check, called from the launcher's native watchdog thread.
+ *
+ * Two failures can silently undo every hook while the process stays alive:
+ *
+ *  1. libapp.so is re-mapped (new Flutter engine/isolate). The old patches are
+ *     gone and every cached Dart object belongs to a dead isolate.
+ *  2. The modified, APK-backed executable pages are evicted under memory
+ *     pressure and re-faulted from MiuiHome.apk, restoring the original
+ *     prologues. The process and all cached objects remain valid, but the
+ *     replacements are no longer reachable.
+ *
+ * Case 1 is repaired by a full InstallLocked() on the new image. Case 2 is
+ * repaired by writing the captured Dobby patch back; its trampoline is still
+ * alive, so the hook becomes effective again without a new DobbyHook(). Any
+ * code that matches neither snapshot is left untouched (fail-open).
+ */
+void EnsureHealthy() {
+#if !defined(__aarch64__)
+    return;
+#else
+    std::lock_guard<std::mutex> lock(g_install_mutex);
+    const std::uintptr_t installed_base =
+        g_installed_image_base.load(std::memory_order_acquire);
+    if (installed_base == 0) {
+        return;
+    }
+
+    aot::Image image;
+    if (!aot::FindImage("libapp.so", &image)) {
+        static std::atomic<bool> missing_logged{false};
+        if (!missing_logged.exchange(true, std::memory_order_relaxed)) {
+            LOGW("health: libapp.so is no longer mapped; hooks stay inactive "
+                 "until it reappears");
+        }
+        return;
+    }
+    if (image.base != installed_base) {
+        LOGW("health: libapp.so moved from %p to %p; reinstalling hooks",
+             reinterpret_cast<void *>(installed_base),
+             reinterpret_cast<void *>(image.base));
+        InstallLocked(image);
+        return;
+    }
+
+    // Every target must still lie inside the executable segment before the
+    // monitor dereferences it. The base check above makes that true for a
+    // normal image, but a malformed/replaced mapping must not turn a health
+    // check into a SIGSEGV.
+    const aot::Span text = aot::FindSegment(image, PF_X);
+    if (!text.Valid() || text.size < kPatchSize) {
+        static std::atomic<bool> text_logged{false};
+        if (!text_logged.exchange(true, std::memory_order_relaxed)) {
+            LOGW("health: libapp.so has no usable executable segment; skipping "
+                 "patch verification");
+        }
+        return;
+    }
+
+    std::uint32_t reapplied = 0;
+    std::uint32_t unknown = 0;
+    for (std::size_t i = 0; i < g_patch_count; ++i) {
+        InstalledPatch &patch = g_patches[i];
+        if (!patch.installed || patch.target == 0) {
+            continue;
+        }
+        if (patch.target < text.address ||
+            patch.target > text.address + text.size - kPatchSize) {
+            ++unknown;
+            LOGW("health: %s at %p is outside the executable segment",
+                 patch.name, reinterpret_cast<void *>(patch.target));
+            continue;
+        }
+        const void *live = reinterpret_cast<const void *>(patch.target);
+        if (std::memcmp(live, patch.patch, kPatchSize) == 0) {
+            continue;
+        }
+        if (std::memcmp(live, patch.original, kPatchSize) == 0) {
+            LOGW("health: %s at %p was restored; re-applying its inline patch",
+                 patch.name, reinterpret_cast<void *>(patch.target));
+            if (WriteCodeBytes(patch.target, patch.patch, kPatchSize)) {
+                ++reapplied;
+            }
+            continue;
+        }
+        ++unknown;
+        LOGW("health: %s at %p has unexpected code; leaving it untouched",
+             patch.name, reinterpret_cast<void *>(patch.target));
+    }
+    if (reapplied != 0) {
+        LOGI("health: re-applied %u hook patch(es)", reapplied);
+    }
+    if (unknown != 0) {
+        LOGW("health: %u hook site(s) contain neither the original prologue "
+             "nor our patch",
+             unknown);
     }
 #endif
 }
@@ -1181,6 +1401,8 @@ namespace miuihome::dart {
 void Install(const aot::Image &) {
     LOGW("Dart hooks: arm64 only; skipping on this ABI");
 }
+
+void EnsureHealthy() {}
 
 }  // namespace miuihome::dart
 

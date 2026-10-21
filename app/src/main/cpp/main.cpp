@@ -353,6 +353,11 @@ void OnLibraryLoaded(const char *name, void *handle) {
     // remaining case where the callback never fires at all).
     if (!g_dart_hooks_installed.load(std::memory_order_acquire)) {
         TryInstallDartHooks(name);
+    } else if (EndsWith(path, kDartImage)) {
+        // A second Flutter engine/isolate in the same process maps libapp.so
+        // again. Run the check synchronously, before that engine executes any
+        // Dart code, so its first frame is already covered by the hooks.
+        miuihome::dart::EnsureHealthy();
     }
 
     if (EndsWith(path, kDartImage)) {
@@ -363,40 +368,48 @@ void OnLibraryLoaded(const char *name, void *handle) {
 }
 
 /**
- * Installs the hooks even if no dlopen() event is ever reported for libapp.so.
+ * Keeps watching libapp.so and the installed patches for the whole process.
  *
- * The framework's callback is the normal path, but it only fires for dlopen()
- * calls that go through the framework. The HyperOS launcher maps its snapshot
- * from inside MiuiHome.apk, so the event can be missing entirely - which is
- * exactly what the device logs showed: native_init ran, yet neither libapp nor
- * libflutter was ever reported. Polling dl_iterate_phdr for 20 s is cheap and
+ * The framework's callback is the normal install path, but it only fires for
+ * dlopen() calls that go through the framework. The HyperOS launcher maps its
+ * snapshot from inside MiuiHome.apk, so the event can be missing entirely -
+ * which is exactly what the device logs showed: native_init ran, yet neither
+ * libapp nor libflutter was ever reported. Polling dl_iterate_phdr is cheap and
  * safe: an install that happens after the first frame only leaves the affected
  * widgets in their original state until they are rebuilt.
+ *
+ * The same thread is also the hook health monitor. It must not exit after the
+ * first successful install: a later engine restart (new libapp.so mapping) or a
+ * memory-pressure eviction of the modified APK-backed code pages silently
+ * undoes inline hooks without killing the process. EnsureHealthy() repairs
+ * either case and logs it.
  */
 void StartDartWatchdog() {
     static std::atomic<bool> started{false};
     if (started.exchange(true, std::memory_order_acq_rel)) {
         return;
     }
-    if (g_dart_hooks_installed.load(std::memory_order_acquire)) {
-        return;
-    }
+    LOGI("watchdog: hook health monitor active (1 s interval)");
     std::thread([] {
-        for (int attempt = 1; attempt <= 40; ++attempt) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            if (g_dart_hooks_installed.load(std::memory_order_acquire)) {
-                return;
+        int attempts = 0;
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            if (!g_dart_hooks_installed.load(std::memory_order_acquire)) {
+                ++attempts;
+                aot::Image image;
+                if (aot::FindImage(kDartImage, &image)) {
+                    LOGI("watchdog: %s appeared without a dlopen callback "
+                         "(attempt %d)", kDartImage, attempts);
+                    TryInstallDartHooks("watchdog");
+                } else if (attempts == 20) {
+                    LOGW("watchdog: %s still not mapped after 20 s; will keep "
+                         "checking every second", kDartImage);
+                    LogLoadedImages("watchdog timeout");
+                }
+                continue;
             }
-            aot::Image image;
-            if (aot::FindImage(kDartImage, &image)) {
-                LOGI("watchdog: %s appeared without a dlopen callback (attempt %d)",
-                     kDartImage, attempt);
-                TryInstallDartHooks("watchdog");
-                return;
-            }
+            miuihome::dart::EnsureHealthy();
         }
-        LOGW("watchdog: %s still not mapped after 20 s; giving up", kDartImage);
-        LogLoadedImages("watchdog timeout");
     }).detach();
 }
 

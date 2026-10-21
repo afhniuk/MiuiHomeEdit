@@ -22,6 +22,23 @@
 
 只改标签列表仍会留下一个旧问题：`AllAppsListWidget` 已经把 N 个页面 child 交给 `_TabBarViewState` 并在 state 中缓存，标签虽然变成 N-1，页面 0 仍是“全部”。因此 `_TabBarViewState.build`（`0x12d12a0`）的 pre-hook 读取 state 原始对象 `+0x1c` 处的 children `List`，在长度大于已修剪分类长度时把元素整体左移一位并写回长度 N-1；`g_pruned_category_length` 记录当前 N-1，后续同一列表或已经是 N-1 的新列表不会被重复左移。实测首屏直接显示“社交通讯”等第一个自定义分类，最后一个标签也能正常打开。
 
+这个左移现在**只依赖列表自身的长度**来保证幂等：长度已经 ≤N-1 的列表直接跳过。早期实现还缓存了最近 32 个“已左移”的列表指针；长时间使用后 Dart GC 会回收旧页面列表，并把同一地址分配给新列表，新列表会被误判为已处理而保留 N 项，页面 0 就再次变成“全部”。该指针缓存已删除，这正是“使用一段时间后页面重新出现”的根因之一。
+
+## 运行期自愈（覆盖整个桌面进程生命周期）
+
+inline hook 只在启动时补一次代码并不够：桌面进程可以一直活着，但补丁仍会在下面两种情况下悄悄失效。
+
+* `libapp.so` 位于 `MiuiHome.apk` 内，其可执行段是文件映射。内存压力下页面被回收（或映射被重建）时，缺页可能从 APK 重新读入原始字节，Dobby 写在函数入口前 16 字节的跳转被覆盖；所有 hook 同时失效，而进程和已缓存的 Dart 对象都仍然有效。
+* 桌面若在同一进程内重建 Flutter 引擎/isolate，`libapp.so` 会以新的 load bias 重新映射，旧补丁留在旧映像上；旧 isolate 的 `_SizedBox`、`NullObject` 等指针也全部作废。
+
+`native_init` 启动的后台线程不再在首次安装后退出，而是每秒调用一次 `miuihome::dart::EnsureHealthy()`：
+
+* `libapp.so` 的 base 变化时，清空 isolate 相关缓存（空 Widget、`false`、已修剪长度），并在新映像上重新安装全部 hook；
+* base 不变时逐项比较目标入口的 16 字节：仍是 Dobby 补丁则跳过；恢复成安装前的原始 prologue 则把保存的补丁写回（trampoline 仍然有效，不需要再次 `DobbyHook`）；两者都不是则只告警，不猜测、不写入；
+* 框架的 `dlopen` 回调看到 `libapp.so` 时也会同步检查一次，覆盖“第二个引擎在回调返回后立刻执行 Dart”的情况。
+
+空 Widget 也不再永久缓存：`GetEmptyWidget()` 每次都用 class id `7713`（该构建的 `_SizedBox`）校验缓存对象，失效就从当前 PP 的对象池重新解析。`false` 改为每次从 x22 派生（`NullObject+0x30`），不再缓存跨 isolate 的指针。健康检查正常时保持安静，只在修复或异常时输出 `health: ...`。
+
 ## 功能
 
 控制面板提供五个互相独立的开关，默认全部关闭：
@@ -261,7 +278,7 @@ adb shell su -c "tail -n 300 /data/user/0/com.miui.home/files/miuihome_edit.log"
 4. `VectorModuleClassLoader.findLibrary()` 把它解析为 `base.apk!/lib/arm64-v8a/libmiuihome_edit.so`，链接器完成映射。
 5. 框架的 `dlopen` hook 将路径与 `native_init.list` 匹配，找到导出的 `native_init` 并**同步**调用；此时 `loadLibrary` 尚未返回。
 6. `native_init()` 把 hook 表（`version`、`hookFunc`、`unhookFunc`）复制到模块中，并返回一个回调。
-7. 框架对触发 `native_init` 的这次库加载以及进程内之后的每次 `dlopen` 调用该回调。`TryInstallDartHooks()` 只等 `libapp.so` 映射（该启动器不带 `libflutter.so`，引擎在 `libapp_launcher.so` 里），然后只调用一次 `Install()`。`native_init` 末尾还会直接尝试一次，并启动一个 20 秒的 watchdog 轮询 `dl_iterate_phdr`：部分 ROM 的加载器绕过框架的 `dlopen` hook，若只依赖回调，快照被映射时不会收到任何事件。
+7. 框架对触发 `native_init` 的这次库加载以及进程内之后的每次 `dlopen` 调用该回调。`TryInstallDartHooks()` 只等 `libapp.so` 映射（该启动器不带 `libflutter.so`，引擎在 `libapp_launcher.so` 里），然后安装一次（`libapp.so` 换 base 时由运行期健康监视重新安装）。`native_init` 末尾还会直接尝试一次，并启动一个常驻的 1 秒 watchdog 轮询 `dl_iterate_phdr`：部分 ROM 的加载器绕过框架的 `dlopen` hook，若只依赖回调，快照被映射时不会收到任何事件；安装完成后同一线程继续做补丁完整性检查。
 
 回调运行时框架仍持有自己的注册表互斥锁，而且调用者的 `dlopen` 尚未返回，因此回调必须很短，并且绝不能自己调用 `dlopen`——嵌套加载会重入互斥锁，导致桌面死锁。Dobby 使用 `Plugin.SymbolResolver=OFF` 构建，所以 `DobbyHook()` 本身也不会 `dlopen`。
 
@@ -399,7 +416,12 @@ Dart hooks: target config drawer=0x14be89c view=0x12d12a0 edit=0x14c2588 setting
 hooked drawer-all-tab at 0x... (original 0x...)
 hooked drawer-tabbar-view at 0x... (original 0x...)
 hooked edit-button at 0x... (original 0x...)
-...
+hooked settings-gear at 0x... (original 0x...)
+hooked search-box at 0x... (original 0x...)
+hooked swipe-up-arrow at 0x... (original 0x...)
+hooked swipe-up-arrow at 0x... (original 0x...)
+watchdog: hook health monitor active (1 s interval)
+empty widget: resolved pool offset 0x6250 -> 0x... (class 7713)
 drawer-tabbar-view: state=0x... list=0x... class=92 len=9
 drawer-tabbar-view: shifted children from 9 to 8
 drawer-all-tab: tabbar #1 self=0x... enabled=1
@@ -413,7 +435,11 @@ settings-gear: decide #1 enabled=1 empty=0x...
 swipe-up-arrow: decide #1 enabled=1 value=0x...
 ```
 
-`image:` 行是“这台设备上到底有哪些引擎库”的唯一可靠答案（`libapp.so` 常常直接映射自 `MiuiHome.apk`，`/proc/maps` 里看不到独立文件）。`libapp.so mapped (... reason=...)` 后面的 `reason` 说明这次安装由哪条路径触发：`native_init`（注入时已映射）、某个 `dlopen` 路径，或 `watchdog`（20 秒内轮询到，通常原因为加载器绕过了框架的 `dlopen` hook）。若 20 秒内始终没有映射，会打印 `watchdog: libapp.so still not mapped after 20 s; giving up` 以及当时的 `image:` 清单。
+`image:` 行是“这台设备上到底有哪些引擎库”的唯一可靠答案（`libapp.so` 常常直接映射自 `MiuiHome.apk`，`/proc/maps` 里看不到独立文件）。`libapp.so mapped (... reason=...)` 后面的 `reason` 说明这次安装由哪条路径触发：`native_init`（注入时已映射）、某个 `dlopen` 路径，或 `watchdog`（每秒轮询到的安装路径，通常原因为加载器绕过了框架的 `dlopen` hook）。20 秒内始终没有映射时只打印一次 `watchdog: libapp.so still not mapped after 20 s; will keep checking every second` 和当时的 `image:` 清单，之后仍会继续等待（热注入或极慢启动仍能生效）。
+
+`watchdog: hook health monitor active (1 s interval)` 表示常驻健康监视线程已启动。它正常时不输出任何内容；只有检测到补丁被还原、`libapp.so` 换了 base、或目标入口出现既不是原始 prologue 也不是 Dobby 补丁的代码时，才打印 `health: ...`。看到 `health: libapp.so moved ... reinstalling hooks` 或 `health: <name> ... was restored; re-applying` 说明自愈已生效，不需要重启桌面。
+
+`empty widget: resolved pool offset 0x6250 -> 0x... (class 7713)` 是正常的首次解析；这个构建已配置 class id，因此**不应**再出现旧版的 `no class id configured; resolved class ... by trust` 警告。出现 `empty widget: cached object ... is no longer a usable SizedBox; re-resolving` 表示 isolate 已更换，模块正在自动重新取对象。
 
 `hooked <name>` 应该有七行（六个名称；`swipe-up-arrow` 的两个注入点各一行）。只有部分行时，缺的那一行前面会打印 `not a safe 16-byte hook site` 或 `DobbyHook(...) failed`，说明偏移与该设备上的 `libapp.so` 不匹配（版本不同或已更新），该目标被跳过，其余目标照常安装。其中 `drawer-tabbar-view` 缺失时，标签会减一但页面仍多一页；看到这种组合应优先核对 `0x12d12a0`。
 

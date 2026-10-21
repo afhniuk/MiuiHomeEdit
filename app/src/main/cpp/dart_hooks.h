@@ -23,4 +23,15 @@ namespace miuihome::dart {
  */
 void Install(const aot::Image &image);
 
+/**
+ * Re-validates the installed hooks against the live process. Call it
+ * periodically: if libapp.so was re-mapped (new engine/isolate) the hooks are
+ * reinstalled on the new image and every isolate-scoped cache is dropped; if
+ * the executable pages were re-faulted from MiuiHome.apk and the original
+ * prologues are back, the captured Dobby patches are written again. Cheap
+ * enough for a one-second watchdog: it only iterates the loader's phdr list
+ * and compares 16 bytes per hook.
+ */
+void EnsureHealthy();
+
 }  // namespace miuihome::dart
