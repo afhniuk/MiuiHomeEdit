@@ -82,6 +82,7 @@ void *g_origin_edit_button = nullptr;
 void *g_origin_settings_gear = nullptr;
 void *g_origin_search_box = nullptr;
 void *g_origin_swipe_up_arrow = nullptr;
+void *g_origin_editor_init = nullptr;
 }
 
 // Length of the category list after the tab-bar hook removed "All". The
@@ -184,6 +185,10 @@ constexpr std::uintptr_t kSettingsGear = 0x14bec50;
 constexpr std::uintptr_t kSearchBox = 0x149df2c;
 constexpr std::uintptr_t kSwipeUpArrow = 0x1176bac;
 constexpr std::uintptr_t kSwipeUpArrowWidget = 0x117735c;
+// AppCategorySelectController.onInit - the category editor's entry point. Its
+// receiver carries the category id the "编辑" tile handed over (receiver +0x20),
+// so this is where the tile-to-editor hand-off can be observed.
+constexpr std::uintptr_t kEditorInit = 0xefbda0;
 
 // `const SizedBox.shrink()` used by the four Widget hooks.
 //
@@ -524,30 +529,317 @@ std::uintptr_t GetFalse() {
 // ---------------------------------------------------------------------------
 // Removing "All" from the drawer category list.
 //
-// DrawerModeDataRepository.buildSortCategoryList returns a growable
-// List<CategoryInfo> whose first entry is normally the built-in "All" category.
-// _AllAppsCategoryTabBar.build receives that list in the receiver field at
-// +0x0c and passes it to the TabController, the TabBar and the TabBarView.
-// Removing the first entry in place before the hooked build continues shrinks
-// every consumer together; index 0 then is the first custom category.
+// DrawerModeDataRepository.buildSortCategoryList returns a growable list whose
+// first entry is normally the built-in "All" category. _AllAppsCategoryTabBar
+// .build receives that list in the receiver field at +0x0c and passes it to the
+// TabController, the TabBar and the TabBarView. Removing the first entry in
+// place before the hooked build continues shrinks every consumer together;
+// index 0 then is the first custom category.
 //
-// This AOT build uses compressed pointers:
+// On this build the list the tab bar consumes is a List<String> of category
+// names (not CategoryInfo), and its first element is the name object for
+// "全部". Compressed pointers:
 //
 //     list raw + 0x0c : length Smi (u32, value << 1)
 //     list raw + 0x10 : data pointer (u32, heap-relative)
 //     data raw + 0x0c : backing-array length Smi
 //     data raw + 0x10 : element 0 (u32 heap-relative tagged pointer)
-//     category raw + 0x08 : id (Smi; raw 4, i.e. id 2, for "All")
-//     category raw + 0x10 : name/hash field (0x90e85168 for "All")
+//     name raw + 0x08 : string length Smi (2 for "全部")
+//     name raw + 0x10 : first four UTF-16 code units ("全部" = 0x90e85168)
 // ---------------------------------------------------------------------------
 constexpr std::uint32_t kMaxCategoryCount = 256;
 // Dart's growable-list class id on this build; the tab-bar hook reads the same
 // value from the receiver, while _TabBarViewState has no such header to check.
 constexpr std::uint32_t kGrowableListClassId = 92;
-// `CategoryInfo` field at object+0x10 for the built-in "All" entry. It is a
-// per-build value, stable for one MIUI Home libapp.so.
+// The built-in "All" entry as it appears in the drawer's name list: the
+// 64-bit word at object+0x10 is the first four UTF-16 characters of "全部"
+// (0x5168 = 全, 0x90e8 = 部). It identifies a list that still contains the
+// built-in category, both for the tab-bar prune and for the page-category
+// lists. Per-build value, stable for one MIUI Home libapp.so.
 constexpr std::uint64_t kAllCategoryField10 = 0x90e85168ull;
 
+
+// ---------------------------------------------------------------------------
+// Keeping the drawer pages (and therefore the "编辑" tile) on the same category
+// as the tab bar.
+//
+// The drawer keeps three parallel views of its categories: the List<String> of
+// names the tab bar consumes (pruned above), a List<int> of category ids, and a
+// list of category objects the page widgets are built from. Pruning only the
+// names leaves page i holding ids[i] - the *previous* page's category - so the
+// "编辑" tile hands that id to AppCategorySelectController.onInit and the editor
+// opens the wrong category (page 1 -> id 0 -> "全部", page 4 -> 1001 -> "游戏").
+// Category ids are not consecutive (1001 sits between 2 and 4), so the id
+// cannot simply be incremented at the editor: both mirrors have to lose their
+// leading "All" entry.
+//
+// The id mirror qualifies when it is a growable list of the same length as the
+// name list whose elements are all small even Smis, distinct, and start with 0
+// (the built-in "All" id) - the shape seen on device is
+// 0,1,2,1001,4,3,5,6,8. That shape describes the mirror and nothing else
+// observed on this heap.
+// ---------------------------------------------------------------------------
+std::uint32_t PruneCategoryIdLists(std::uintptr_t heap_base,
+                                   std::uint32_t expected_count) {
+    constexpr std::uintptr_t kHeapWindow = 0x40000000ull;
+    constexpr std::uint32_t kMaxIdValue = 0x200000;
+
+    if (expected_count < 3 || expected_count > kMaxCategoryCount) {
+        return 0;
+    }
+    FILE *maps = std::fopen("/proc/self/maps", "re");
+    if (maps == nullptr) {
+        return 0;
+    }
+    const std::uintptr_t heap_end = heap_base + kHeapWindow;
+    std::uint32_t pruned = 0;
+    std::uintptr_t shifted_arrays[64] = {};
+    std::uint32_t shifted_array_count = 0;
+    char line[512];
+    while (std::fgets(line, sizeof(line), maps) != nullptr) {
+        unsigned long long start_ull = 0;
+        unsigned long long stop_ull = 0;
+        char perms[8] = {};
+        if (std::sscanf(line, "%llx-%llx %7s", &start_ull, &stop_ull, perms) !=
+            3) {
+            continue;
+        }
+        const std::uintptr_t start = static_cast<std::uintptr_t>(start_ull);
+        const std::uintptr_t stop = static_cast<std::uintptr_t>(stop_ull);
+        if (perms[0] != 'r' || stop <= heap_base || start >= heap_end) {
+            continue;
+        }
+        const std::uintptr_t begin =
+            ((start < heap_base ? heap_base : start) + 7) & ~7ull;
+        for (std::uintptr_t address = begin; address + 0x18 <= stop;
+             address += 8) {
+            std::uint32_t tags = 0;
+            std::memcpy(&tags, reinterpret_cast<const void *>(address),
+                        sizeof(tags));
+            if (((tags >> kClassIdShift) & kClassIdMask) !=
+                kGrowableListClassId) {
+                continue;
+            }
+            std::uint32_t length_smi = 0;
+            std::memcpy(&length_smi,
+                        reinterpret_cast<const void *>(address + 0x0c),
+                        sizeof(length_smi));
+            if ((length_smi >> 1) != expected_count) {
+                continue;
+            }
+            std::uint32_t data_compressed = 0;
+            std::memcpy(&data_compressed,
+                        reinterpret_cast<const void *>(address + 0x10),
+                        sizeof(data_compressed));
+            const std::uintptr_t data = heap_base + data_compressed;
+            if ((data & 1u) == 0 || data < heap_base + 0x10000 ||
+                !IsReadableMemory(data - 1 + 0x10, 4u * expected_count)) {
+                continue;
+            }
+            const std::uintptr_t data_raw = data - 1;
+            const std::uintptr_t slots = data_raw + 0x10;
+            std::uint32_t values[kMaxCategoryCount] = {};
+            bool qualifies = true;
+            for (std::uint32_t i = 0; i < expected_count; ++i) {
+                std::uint32_t value = 0;
+                std::memcpy(&value,
+                            reinterpret_cast<const void *>(slots + 4u * i),
+                            sizeof(value));
+                if ((value & 1u) != 0 || value > kMaxIdValue) {
+                    qualifies = false;
+                    break;
+                }
+                values[i] = value;
+                for (std::uint32_t j = 0; j < i; ++j) {
+                    if (values[j] == value) {
+                        qualifies = false;
+                        break;
+                    }
+                }
+                if (!qualifies) {
+                    break;
+                }
+            }
+            if (!qualifies || values[0] != 0) {
+                continue;
+            }
+            bool array_seen = false;
+            for (std::uint32_t i = 0; i < shifted_array_count; ++i) {
+                if (shifted_arrays[i] == data_raw) {
+                    array_seen = true;
+                    break;
+                }
+            }
+            if (array_seen) {
+                continue;
+            }
+            if (shifted_array_count < 64) {
+                shifted_arrays[shifted_array_count++] = data_raw;
+            }
+            // Drop the leading "All" id exactly like List.removeAt(0): shift
+            // the elements left and lower the length; the backing array keeps
+            // its capacity.
+            const std::uint32_t remaining = expected_count - 1;
+            std::memmove(reinterpret_cast<void *>(slots),
+                         reinterpret_cast<const void *>(slots + 4),
+                         static_cast<std::size_t>(remaining) *
+                             sizeof(std::uint32_t));
+            const std::uint32_t new_length_smi = remaining << 1;
+            std::memcpy(reinterpret_cast<void *>(address + 0x0c),
+                        &new_length_smi, sizeof(new_length_smi));
+            ++pruned;
+            LOGI("drawer-ids: shifted id list=0x%zx from %u to %u entries",
+                 address + 1, expected_count, remaining);
+        }
+    }
+    std::fclose(maps);
+    return pruned;
+}
+
+/**
+ * Removes the leading entry from the category *object* list the drawer pages are
+ * built from.
+ *
+ * The page widgets read their category id from a growable list of category
+ * objects that still starts with the built-in "All" entry, so page i carries the
+ * id of category i-1 - which is what the "编辑" tile then hands to the editor.
+ * Pruning the name list alone is not enough because the page ids come from this
+ * object list.
+ *
+ * A list qualifies when it has the same length as the name list and its first
+ * element is a category object that references the built-in "All" name: one of
+ * its reference fields points at a string whose inline payload is
+ * kAllCategoryField10. A List<String> cannot match, because its first element is
+ * the "全部" string itself and the payload is inline rather than a pointer.
+ */
+std::uint32_t PruneCategoryObjectLists(std::uintptr_t heap_base,
+                                       std::uint32_t expected_count) {
+    constexpr std::uintptr_t kHeapWindow = 0x40000000ull;
+    constexpr std::uint32_t kCandidateOffsets[] = {0x08, 0x0c, 0x10, 0x14, 0x18};
+
+    if (expected_count < 3 || expected_count > kMaxCategoryCount) {
+        return 0;
+    }
+    FILE *maps = std::fopen("/proc/self/maps", "re");
+    if (maps == nullptr) {
+        return 0;
+    }
+    const std::uintptr_t heap_end = heap_base + kHeapWindow;
+    std::uint32_t pruned = 0;
+    std::uintptr_t shifted_arrays[64] = {};
+    std::uint32_t shifted_array_count = 0;
+    char line[512];
+    while (std::fgets(line, sizeof(line), maps) != nullptr) {
+        unsigned long long start_ull = 0;
+        unsigned long long stop_ull = 0;
+        char perms[8] = {};
+        if (std::sscanf(line, "%llx-%llx %7s", &start_ull, &stop_ull, perms) !=
+            3) {
+            continue;
+        }
+        const std::uintptr_t start = static_cast<std::uintptr_t>(start_ull);
+        const std::uintptr_t stop = static_cast<std::uintptr_t>(stop_ull);
+        if (perms[0] != 'r' || stop <= heap_base || start >= heap_end) {
+            continue;
+        }
+        const std::uintptr_t begin =
+            ((start < heap_base ? heap_base : start) + 7) & ~7ull;
+        for (std::uintptr_t address = begin; address + 0x18 <= stop;
+             address += 8) {
+            std::uint32_t tags = 0;
+            std::memcpy(&tags, reinterpret_cast<const void *>(address),
+                        sizeof(tags));
+            if (((tags >> kClassIdShift) & kClassIdMask) !=
+                kGrowableListClassId) {
+                continue;
+            }
+            std::uint32_t length_smi = 0;
+            std::memcpy(&length_smi,
+                        reinterpret_cast<const void *>(address + 0x0c),
+                        sizeof(length_smi));
+            if ((length_smi >> 1) != expected_count) {
+                continue;
+            }
+            std::uint32_t data_compressed = 0;
+            std::memcpy(&data_compressed,
+                        reinterpret_cast<const void *>(address + 0x10),
+                        sizeof(data_compressed));
+            const std::uintptr_t data = heap_base + data_compressed;
+            if ((data & 1u) == 0 || data < heap_base + 0x10000 ||
+                !IsReadableMemory(data - 1 + 0x10, 4u * expected_count)) {
+                continue;
+            }
+            const std::uintptr_t slots = data - 1 + 0x10;
+            std::uint32_t first_compressed = 0;
+            std::memcpy(&first_compressed,
+                        reinterpret_cast<const void *>(slots),
+                        sizeof(first_compressed));
+            const std::uintptr_t first = heap_base + first_compressed;
+            if ((first & 1u) == 0 || first < heap_base + 0x10000) {
+                continue;
+            }
+            std::uint32_t matched_offset = 0;
+            for (const std::uint32_t offset : kCandidateOffsets) {
+                if (!IsReadableMemory(first - 1 + offset,
+                                      sizeof(std::uint32_t))) {
+                    continue;
+                }
+                std::uint32_t name_compressed = 0;
+                std::memcpy(&name_compressed,
+                            reinterpret_cast<const void *>(first - 1 + offset),
+                            sizeof(name_compressed));
+                if ((name_compressed & 1u) == 0) {
+                    continue;
+                }
+                const std::uintptr_t name = heap_base + name_compressed;
+                if (name < heap_base + 0x10000 ||
+                    !IsReadableMemory(name - 1 + 0x10, sizeof(std::uint32_t))) {
+                    continue;
+                }
+                std::uint32_t payload = 0;
+                std::memcpy(&payload,
+                            reinterpret_cast<const void *>(name - 1 + 0x10),
+                            sizeof(payload));
+                if (payload == static_cast<std::uint32_t>(kAllCategoryField10)) {
+                    matched_offset = offset;
+                    break;
+                }
+            }
+            if (matched_offset == 0) {
+                continue;
+            }
+            // Two list objects can share one backing array; shifting it twice
+            // would drop two categories.
+            bool array_seen = false;
+            for (std::uint32_t i = 0; i < shifted_array_count; ++i) {
+                if (shifted_arrays[i] == data - 1) {
+                    array_seen = true;
+                    break;
+                }
+            }
+            if (array_seen) {
+                continue;
+            }
+            if (shifted_array_count < 64) {
+                shifted_arrays[shifted_array_count++] = data - 1;
+            }
+            const std::uint32_t remaining = expected_count - 1;
+            std::memmove(reinterpret_cast<void *>(slots),
+                         reinterpret_cast<const void *>(slots + 4),
+                         static_cast<std::size_t>(remaining) *
+                             sizeof(std::uint32_t));
+            const std::uint32_t new_length_smi = remaining << 1;
+            std::memcpy(reinterpret_cast<void *>(address + 0x0c),
+                        &new_length_smi, sizeof(new_length_smi));
+            ++pruned;
+            LOGI("drawer-ids: shifted category list=0x%zx (name at +0x%02x) "
+                 "from %u to %u entries",
+                 address + 1, matched_offset, expected_count, remaining);
+        }
+    }
+    std::fclose(maps);
+    return pruned;
+}
 
 /**
  * Finds the real List<CategoryInfo> by scanning the Dart heap directly.
@@ -611,7 +903,9 @@ std::uint32_t ScanHeapForAllCategoryList(std::uintptr_t heap_base,
             std::uint32_t length_smi = 0;
             std::memcpy(&tags, reinterpret_cast<const void *>(address),
                         sizeof(tags));
-            if (((tags >> kClassIdShift) & kClassIdMask) != list_class_id) {
+            const std::uint32_t list_class =
+                (tags >> kClassIdShift) & kClassIdMask;
+            if (list_class != list_class_id) {
                 continue;
             }
             std::memcpy(&length_smi,
@@ -673,8 +967,7 @@ std::uint32_t ScanHeapForAllCategoryList(std::uintptr_t heap_base,
             LOGI("drawer-all-tab-scan: heap match #%u list=0x%zx raw=0x%zx "
                  "class=%u len=%u data=0x%zx array_len=%u first_id=0x%llx "
                  "first_f10=0x%llx",
-                 matches, address + 1, address,
-                 (tags >> kClassIdShift) & kClassIdMask, length_smi >> 1,
+                 matches, address + 1, address, list_class, length_smi >> 1,
                  data, array_length_smi >> 1,
                  static_cast<unsigned long long>(id),
                  static_cast<unsigned long long>(field10));
@@ -796,6 +1089,15 @@ extern "C" __attribute__((used)) std::uintptr_t PruneDrawerAllTab(void *,
 
     LOGI("drawer-all-tab: pruning class=%u len=%u list=%p", list_class, length,
          reinterpret_cast<void *>(list));
+    // The page widgets are built from the parallel List<int> of category ids,
+    // which still starts with the built-in "All" id. Shift it in the same pass
+    // so page i carries the category the tab bar shows at position i.
+    const std::uint32_t id_lists_pruned =
+        PruneCategoryIdLists(heap_base, length);
+    const std::uint32_t category_lists_pruned =
+        PruneCategoryObjectLists(heap_base, length);
+    LOGI("drawer-all-tab: shifted %u id list(s) and %u category list(s)",
+         id_lists_pruned, category_lists_pruned);
     const std::uint32_t pruned =
         ScanHeapForAllCategoryList(heap_base, length, list_class, true);
     if (pruned == 0) {
@@ -902,6 +1204,7 @@ extern "C" __attribute__((used)) std::uintptr_t MutateTabBarViewChildren(
     return 0;
 }
 
+
 // ---------------------------------------------------------------------------
 // Decision functions.
 //
@@ -931,8 +1234,51 @@ std::uintptr_t DecideEmptyWidget(config::Feature feature) {
     return GetEmptyWidget();
 }
 
+// ---------------------------------------------------------------------------
+// AppCategorySelectController.onInit - the category editor's entry point.
+//
+// The receiver carries the category id the "编辑" tile handed over in an
+// unboxed 64-bit int at +0x20 (`onInit` boxes it with `sbfiz x0, x6, #1, #31`;
+// values seen on device: 0 = "全部", 1 = "社交通讯", 3 = "学习", 4 = "实用工具",
+// 1001 = "游戏"). The editor resolves that id against its own category data and
+// shows the matching category, so this log is the quickest way to confirm that
+// a page tile handed over its own category. The hook never writes anything.
+// ---------------------------------------------------------------------------
+extern "C" __attribute__((used)) std::uintptr_t InspectEditorInit(
+    void *, void *self, void *, void *, void *, void *) {
+    static std::atomic<int> g_calls{0};
+    const int call = g_calls.fetch_add(1, std::memory_order_relaxed);
+    if (call >= 24 ||
+        !config::IsEnabled(config::Feature::kHideDrawerAllTab)) {
+        return 0;
+    }
+    const std::uintptr_t heap_base = GetDartHeapBase();
+    const std::uintptr_t tagged = reinterpret_cast<std::uintptr_t>(self);
+    if (heap_base == 0 || tagged < 0x1000 || (tagged & 1u) == 0) {
+        return 0;
+    }
+    const std::uintptr_t raw = tagged - 1;
+    if (!IsReadableMemory(raw, 0x28)) {
+        return 0;
+    }
+    std::uint32_t tags = 0;
+    std::memcpy(&tags, reinterpret_cast<const void *>(raw), sizeof(tags));
+    std::uint64_t category_id = 0;
+    std::memcpy(&category_id, reinterpret_cast<const void *>(raw + 0x20),
+                sizeof(category_id));
+    LOGI("editor-init: self=%p class=%u category id=%llu",
+         reinterpret_cast<void *>(tagged),
+         (tags >> kClassIdShift) & kClassIdMask,
+         static_cast<unsigned long long>(category_id));
+    return 0;
+}
+
+/** Hides the "编辑" tile; the tile itself needs no other adjustment. */
 extern "C" __attribute__((used)) std::uintptr_t DecideEditButton() {
-    return DecideEmptyWidget(config::Feature::kHideEditButton);
+    if (!config::IsEnabled(config::Feature::kHideEditButton)) {
+        return 0;
+    }
+    return GetEmptyWidget();
 }
 
 extern "C" __attribute__((used)) std::uintptr_t DecideSettingsGear() {
@@ -1047,6 +1393,7 @@ MIUIHOME_HOOK(shim_search_box, DecideSearchBox, g_origin_search_box);
 MIUIHOME_HOOK(shim_swipe_up_arrow, DecideSwipeUpArrow, g_origin_swipe_up_arrow);
 MIUIHOME_HOOK(shim_swipe_arrow_widget, DecideSwipeArrowWidget,
                g_origin_swipe_arrow_widget);
+MIUIHOME_HOOK(shim_editor_init, InspectEditorInit, g_origin_editor_init);
 
 struct HookSpec {
     const char *name;
@@ -1076,6 +1423,9 @@ MIUIHOME_RETAIN const HookSpec kHooks[] = {
     {"swipe-up-arrow", target::kSwipeUpArrowWidget,
      reinterpret_cast<void *>(&shim_swipe_arrow_widget),
      &g_origin_swipe_arrow_widget, true},
+    {"editor-init", target::kEditorInit,
+     reinterpret_cast<void *>(&shim_editor_init), &g_origin_editor_init,
+     false},
 };
 
 /**
@@ -1224,12 +1574,13 @@ void InstallLocked(const aot::Image &image) {
     config::Initialize();
 
     LOGI("Dart hooks: target config drawer=0x%zx view=0x%zx edit=0x%zx "
-         "settings=0x%zx search=0x%zx swipe=0x%zx "
+         "settings=0x%zx search=0x%zx swipe=0x%zx editor-init=0x%zx "
          "emptyWidgetPool=0x%zx emptyWidgetVaddr=0x%zx falsePool=0x%zx "
          "falseVaddr=0x%zx",
          target::kDrawerAllTabBuild, target::kTabBarViewBuild,
          target::kEditButton, target::kSettingsGear, target::kSearchBox,
-         target::kSwipeUpArrow, target::kEmptyWidgetPoolOffset,
+         target::kSwipeUpArrow, target::kEditorInit,
+         target::kEmptyWidgetPoolOffset,
          target::kEmptyWidgetObjectVaddr, target::kFalsePoolOffset,
          target::kFalseObjectVaddr);
 
