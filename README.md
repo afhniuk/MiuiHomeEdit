@@ -10,11 +10,11 @@
 
 | # | 功能 | `libapp.so` 内偏移 | 目标函数 |
 | --- | --- | --- | --- |
-| 1 | 抽屉“全部”分类 | `0x14be89c` + `0x12d12a0` | `_AllAppsCategoryTabBar.build` 修剪分类列表；`_TabBarViewState.build` 同步左移缓存的页面 children |
-| 2 | 编辑按钮 | `0x14c2588` | `NormalAppListWidget._buildEditWidget`（仅用于隐藏图块；分类对齐由第 1 项在抽屉数据层完成） |
-| 3 | 设置齿轮 | `0x14bec50` | `_AllAppsSettingsIcon.build` |
-| 4 | 搜索框 | `0x149df2c` | `SearchBarContainerWidget.build`（桌面与抽屉共用） |
-| 5 | 上滑箭头 | `0x1176bac` + `0x117735c` | `LauncherIndicatorState._showAllAppsArrowIndicator`，并额外挂 `_buildAllAppsIndicator` 作为 Widget 兜底 |
+| 1 | 隐藏“全部”标签页 | `0x14be89c` + `0x12d12a0` | `_AllAppsCategoryTabBar.build` 修剪分类列表；`_TabBarViewState.build` 同步左移缓存的页面 children |
+| 2 | 隐藏编辑按钮 | `0x14c2588` | `NormalAppListWidget._buildEditWidget`（仅用于隐藏图块；分类对齐由第 1 项在抽屉数据层完成） |
+| 3 | 隐藏设置齿轮 | `0x14bec50` | `_AllAppsSettingsIcon.build` |
+| 4 | 隐藏搜索框 | `0x149df2c` | `SearchBarContainerWidget.build`（桌面与抽屉共用） |
+| 5 | 隐藏上滑箭头 | `0x1176bac` + `0x117735c` | `LauncherIndicatorState._showAllAppsArrowIndicator`，并额外挂 `_buildAllAppsIndicator` 作为 Widget 兜底 |
 
 这些偏移只对上面这一个构建成立：Dobby 会改写目标函数入口的前 16 字节，偏差几个字节就会变成启动循环。换版本后必须用 build-id 重新核对。每个目标成功安装时打印一行 `hooked <name> at 0x... (original 0x...)`；某个目标失败只跳过它自己，其余照常安装。
 
@@ -60,11 +60,13 @@ inline hook 只在启动时补一次代码并不够：桌面进程可以一直�
 
 | 开关 | JSON 键 | 目标与效果 |
 | --- | --- | --- |
-| 隐藏抽屉“全部”标签 | `hide_drawer_all_tab` | 从标签栏共享的分类列表移除内置“全部”项；只保留自定义标签，第一个页面即第一个自定义标签 |
-| 隐藏桌面编辑按钮 | `hide_edit_button` | 编辑模式入口的 Widget 构建函数返回空 Widget |
-| 隐藏桌面设置齿轮 | `hide_settings_gear` | 设置入口的 Widget 构建函数返回空 Widget |
-| 隐藏搜索框 | `hide_search_box` | `SearchBarContainerWidget.build` 返回空 Widget，桌面与抽屉搜索框一起隐藏 |
-| 隐藏上滑箭头 | `hide_swipe_up_arrow` | 上滑提示 predicate 返回静态 `false` 对象 |
+| 隐藏“全部”标签页 | `hide_drawer_all_tab` | 从抽屉模式的标签栏中移除“全部”标签，并将进入抽屉模式的首页面改为首个自定义标签页 |
+| 隐藏编辑按钮 | `hide_edit_button` | 隐藏排列在每个标签页最后一位的编辑按钮 |
+| 隐藏设置齿轮 | `hide_settings_gear` | 隐藏位于抽屉模式标签栏最右侧的设置齿轮 |
+| 隐藏搜索框 | `hide_search_box` | 隐藏抽屉模式位于每个标签页下方的应用搜索框 |
+| 隐藏上滑箭头 | `hide_swipe_up_arrow` | 隐藏手机主页下方用于引导进入抽屉模式的上滑箭头 |
+
+搜索框 hook 挂在 `SearchBarContainerWidget.build` 上，桌面与抽屉共用同一构建函数，因此两处的搜索框会一起隐藏。
 
 配置缺失、文件不可读、JSON 损坏或没有任何有效候选文件时，五个功能都保持关闭。JSON 中出现未知键不会导致文件失效，便于后续版本扩展。
 
@@ -157,7 +159,8 @@ AGP 会输出 `app/build/outputs/apk/release/app-release-unsigned.apk`。该 APK
 1. `ConfigStore` 先把 JSON 原子写入模块自己的 `filesDir`。
 2. 有 Root 时，通过 `su` 执行一段 POSIX `sh` 脚本，把文件复制到 `com.miui.home` 的设备加密 `files` 目录（`/data/user_de/<user>/...`）、CE 私有 `files` 目录和外部 `files` 目录，并 `chown` 到桌面 UID；同时刷新 `/storage/emulated/<user>/MiuiHomeEdit/`。写入使用“临时文件 + `mv`”，启动器不会读到写了一半的 JSON。设备加密目录在开机解锁前就可读，因此冷启动早期也能拿到开关。
 3. 没有 Root 时，在获得“所有文件访问”权限后尝试写公共目录 `MiuiHomeEdit`；该回退路径可能无法被桌面读取，面板状态区会明确提示。
-4. 面板不会自动强制停止桌面；单独的“重启 com.miui.home”按钮执行 `am force-stop --user <桌面用户> com.miui.home`。**保存开关不会热更新正在运行的桌面**：只有桌面进程重新启动后，native 才会读取新 JSON 并锁存为本次进程的配置快照。
+4. 面板不会自动强制停止桌面；单独的“重启桌面”按钮执行 `am force-stop --user <桌面用户> com.miui.home`。**保存开关不会热更新正在运行的桌面**：只有桌面进程重新启动后，native 才会读取新 JSON 并锁存为本次进程的配置快照。
+5. 面板顶部状态区显示 `Android`、`Root`、`所有文件访问权限`、`LSPosed作用域` 四项。`Root` 在每次回到面板时以及每次保存结束后重新查询 `su -c id`，分别显示“已授予/未授予”；`LSPosed作用域` 优先用 `su` 把框架的 `lspd/config/modules_config.db`（含 `-wal`/`-shm`）复制到模块缓存目录，再用平台 SQLite 读取 `modules_state.enabled` 与 `scope` 表判断本模块是否已启用且包含 `com.miui.home`；数据库读不到时退化为检查本模块 APK 是否已映射进 `com.miui.home` 进程，结果只有“已启用/未启用”两种。
 
 配置文件名为 `miuihome_edit.json`：
 
@@ -313,7 +316,7 @@ adb shell su -c "tail -n 300 /data/user/0/com.miui.home/files/miuihome_edit.log"
                               reinterpret_cast<void *>(&MyReplacement));
   ```
 
-* **`libapp.so` 内的 Dart AOT 代码**：`dart_hooks.cpp` 为五项桌面功能（抽屉“全部”标签、编辑按钮、设置齿轮、搜索框、上滑箭头）安装八个 Dobby inline hook（七个名称：`swipe-up-arrow` 有两个注入点，另一个是只读诊断用的 `editor-init`）。目标地址位于该文件顶部。
+* **`libapp.so` 内的 Dart AOT 代码**：`dart_hooks.cpp` 为五项功能（隐藏“全部”标签页、隐藏编辑按钮、隐藏设置齿轮、隐藏搜索框、隐藏上滑箭头）安装八个 Dobby inline hook（七个名称：`swipe-up-arrow` 有两个注入点，另一个是只读诊断用的 `editor-init`）。目标地址位于该文件顶部。
 
 ### Dart AOT ABI 要点
 
@@ -327,9 +330,9 @@ adb shell su -c "tail -n 300 /data/user/0/com.miui.home/files/miuihome_edit.log"
 
 | # | 目标 | 返回类型 | 决策函数返回 |
 | --- | --- | --- | --- |
-| 1 | 抽屉“全部”分类（两个注入点） | `void`（原函数正常执行） | 标签栏 build：校验 receiver 列表并原地移除“全部”；TabBarView build：把缓存的页面 children 左移一位 |
-| 2-4 | 编辑 / 齿轮 / 搜索框构建函数 | Dart `Widget` 对象 | 池槽位 `0x6250` 的 `const SizedBox.shrink()` |
-| 5 | 上滑箭头 predicate | Dart `bool` 对象 | 规范 `false`（`NullObject + 0x30`，取自 x22） |
+| 1 | 隐藏“全部”标签页（两个注入点） | `void`（原函数正常执行） | 标签栏 build：校验 receiver 列表并原地移除“全部”；TabBarView build：把缓存的页面 children 左移一位 |
+| 2-4 | 隐藏编辑按钮 / 隐藏设置齿轮 / 隐藏搜索框，三者的构建函数 | Dart `Widget` 对象 | 池槽位 `0x6250` 的 `const SizedBox.shrink()` |
+| 5 | 隐藏上滑箭头 predicate | Dart `bool` 对象 | 规范 `false`（`NullObject + 0x30`，取自 x22） |
 
 为什么需要 shim：这些目标的第一条指令就是 Dart 序言 `stp x29, x30, [x15, #-0x10]!`，随后是 `mov x29, x15` 和 `sub x15, x15, #N`。x15 是 Dart 的栈指针，而 AAPCS64 把它归为临时寄存器，C 函数以及它调用的 `mincore`、`__android_log_print` 都可能改写它；调用方却依赖它（例如 `_showAllAppsArrowIndicator` 在 `0x1176cac` 用 `str x16, [x15]` 写栈参数）。因此 shim 先保存 x15、x0-x8 和 q0-q7，调用决策函数，然后全部恢复：决策结果为 0 时带着原始参数 `br` 到 Dobby 的 trampoline（等价于透明调用原函数，LR 保持不变），否则把结果放进 `x0` 直接 `ret` 回 Dart 调用方。`x21`/`x22`/`x24`/`x26`/`x27`/`x28` 另由 `-ffixed` 保证不被 C 代码分配。
 

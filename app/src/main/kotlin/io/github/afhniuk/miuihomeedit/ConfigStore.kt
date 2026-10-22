@@ -4,9 +4,11 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.database.sqlite.SQLiteDatabase
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.os.Process
 import android.provider.Settings
 import android.util.Log
 import java.io.File
@@ -128,6 +130,45 @@ object ConfigStore {
     fun targetInstalled(context: Context): Boolean = targetUid(context) != null
 
     fun allFilesAccessGranted(): Boolean = Environment.isExternalStorageManager()
+
+    /**
+     * Fresh root answer for the panel status block. `su -c id` is the cheapest
+     * way to make the manager answer: a denied or revoked grant exits non-zero,
+     * an approved one prints `uid=0`.
+     */
+    fun rootGranted(): Boolean {
+        val result = runSu("id", maxOutputChars = 8 * 1024, timeoutSeconds = 15)
+        return result.exitCode == 0 && result.output.contains("uid=0")
+    }
+
+    enum class ScopeState { Enabled, Disabled }
+
+    /**
+     * Whether the framework has this module enabled with com.miui.home in its
+     * scope.
+     *
+     * The framework keeps that state in a root-only SQLite database
+     * (lspd/config/modules_config.db). Normal devices ship no sqlite3 binary, so
+     * the database is copied through su into the cache directory and read with
+     * the platform SQLite reader. When the copy or the query fails, the
+     * launcher's memory map is used instead: this module's APK being mapped
+     * inside the com.miui.home process proves that the module and its scope are
+     * both active.
+     */
+    fun scopeState(context: Context): ScopeState {
+        val database = copyFrameworkDatabase(context)
+        if (database != null) {
+            val enabled = queryScopeFromDatabase(database, context.packageName)
+            if (enabled != null) {
+                return if (enabled) ScopeState.Enabled else ScopeState.Disabled
+            }
+        }
+        return if (launcherHasModuleMapped(context) == true) {
+            ScopeState.Enabled
+        } else {
+            ScopeState.Disabled
+        }
+    }
 
     fun requestAllFilesAccess(context: Context) {
         val appIntent = Intent(
@@ -570,6 +611,125 @@ object ConfigStore {
         } catch (e: PackageManager.NameNotFoundException) {
             null
         }
+    }
+
+    /**
+     * Copies the framework database (and its WAL sidecars) into the cache
+     * directory, world-readable, so the app itself can query it. The framework
+     * may be writing while the copy is taken, hence the read-only open plus the
+     * memory-map fallback in [scopeState].
+     */
+    private fun copyFrameworkDatabase(context: Context): File? {
+        val directory = File(context.cacheDir, "framework").apply { mkdirs() }
+        val target = File(directory, "modules_config.db")
+        val sidecars = listOf(
+            File(directory, "modules_config.db-wal"),
+            File(directory, "modules_config.db-shm"),
+        )
+        (sidecars + target).forEach { it.delete() }
+        val quoted = (listOf(target) + sidecars).map { shellQuote(it.absolutePath) }
+        val script = buildString {
+            append("for db in /data/adb/lspd/config/modules_config.db ")
+            append("/data/adb/vector/config/modules_config.db; do\n")
+            append("  [ -f \"\$db\" ] || continue\n")
+            append("  cp \"\$db\" ").append(quoted[0]).append(" || continue\n")
+            append("  [ -f \"\$db-wal\" ] && cp \"\$db-wal\" ").append(quoted[1]).append('\n')
+            append("  [ -f \"\$db-shm\" ] && cp \"\$db-shm\" ").append(quoted[2]).append('\n')
+            append("  chmod 666 ").append(quoted.joinToString(" ")).append(" 2>/dev/null\n")
+            append("  echo DB_COPIED\n  exit 0\n")
+            append("done\necho DB_MISSING\n")
+        }
+        val result = runSu(script, maxOutputChars = 8 * 1024, timeoutSeconds = 15)
+        return if (result.output.contains("DB_COPIED") && target.isFile) target else null
+    }
+
+    /**
+     * Reads the module's enabled flag and its scope rows from the copied
+     * database. Both the current schema (modules_state per user) and the legacy
+     * one (mid columns) are handled; null means "not readable", so the caller
+     * can fall back to the memory-map check.
+     */
+    private fun queryScopeFromDatabase(database: File, modulePackage: String): Boolean? {
+        val userId = Process.myUid() / 100000
+        return try {
+            val db = SQLiteDatabase.openDatabase(
+                database.absolutePath,
+                null,
+                SQLiteDatabase.OPEN_READONLY,
+            ) ?: return null
+            db.use {
+                val enabled = scalar(
+                    it,
+                    "SELECT enabled FROM modules_state WHERE module_pkg_name = ? AND user_id = ?",
+                    arrayOf(modulePackage, userId.toString()),
+                )
+                if (enabled != null) {
+                    if (enabled == 0) {
+                        return false
+                    }
+                    val scoped = scalar(
+                        it,
+                        "SELECT count(*) FROM scope WHERE module_pkg_name = ? AND app_pkg_name = ?" +
+                            " AND user_id = ?",
+                        arrayOf(modulePackage, TARGET_PACKAGE, userId.toString()),
+                    )
+                    return (scoped ?: 0) > 0
+                }
+                val mid = scalar(
+                    it,
+                    "SELECT mid FROM modules WHERE module_pkg_name = ? LIMIT 1",
+                    arrayOf(modulePackage),
+                ) ?: return null
+                val legacyEnabled = scalar(
+                    it,
+                    "SELECT enabled FROM modules WHERE mid = ?",
+                    arrayOf(mid.toString()),
+                ) ?: return false
+                if (legacyEnabled == 0) {
+                    return false
+                }
+                val scoped = scalar(
+                    it,
+                    "SELECT count(*) FROM scope WHERE mid = ? AND app_pkg_name = ?",
+                    arrayOf(mid.toString(), TARGET_PACKAGE),
+                )
+                (scoped ?: 0) > 0
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Framework database is unreadable", e)
+            null
+        }
+    }
+
+    /** First integer column of the first row; null when the query fails. */
+    private fun scalar(db: SQLiteDatabase, sql: String, args: Array<String>): Int? =
+        try {
+            db.rawQuery(sql, args).use { cursor ->
+                if (cursor.moveToFirst()) cursor.getInt(0) else 0
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Framework query failed: $sql", e)
+            null
+        }
+
+    /**
+     * True when this module's APK is mapped inside the launcher process, i.e.
+     * the framework really injected it there. Null when root is unavailable.
+     */
+    private fun launcherHasModuleMapped(context: Context): Boolean? {
+        val moduleApkPath = "pm path ${shellQuote(context.packageName)} 2>/dev/null" +
+            " | sed -n 's/^package://p' | head -n 1"
+        val script = "apk=\$($moduleApkPath)\n" +
+            "pid=\$(pidof $TARGET_PACKAGE 2>/dev/null)\n" +
+            "[ -n \"\$pid\" ] || pid=\$(ps -A 2>/dev/null" +
+            " | awk '\$NF==\"$TARGET_PACKAGE\" {print \$2; exit}')\n" +
+            "if [ -n \"\$apk\" ] && [ -n \"\$pid\" ] && grep -qaF -- \"\$apk\" /proc/\$pid/maps;" +
+            " then\n  echo MODULE_MAPPED\nelse\n  echo MODULE_NOT_MAPPED\nfi\n"
+        val result = runSu(script, maxOutputChars = 8 * 1024, timeoutSeconds = 15)
+        if (result.exitCode != 0) {
+            return null
+        }
+        return result.output.contains("MODULE_MAPPED")
     }
 
     /**

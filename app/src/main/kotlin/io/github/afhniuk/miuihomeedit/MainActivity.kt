@@ -44,6 +44,11 @@ class MainActivity : Activity() {
     private var lastDiagnostics: ConfigStore.DiagnosticReport? = null
     private var saving = false
 
+    /** null while the background query is still running. */
+    private var rootGranted: Boolean? = null
+    private var scopeState: ConfigStore.ScopeState? = null
+    private var checkingEnvironment = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         config = ConfigStore.loadLocal(this)
@@ -58,7 +63,42 @@ class MainActivity : Activity() {
         super.onResume()
         if (::statusView.isInitialized) {
             refreshTargetState()
+            checkEnvironment()
         }
+    }
+
+    /**
+     * Root and the framework scope can change while the panel is in the
+     * background, so both are queried again on every entry. su may block on the
+     * manager's prompt, therefore the query runs off the main thread.
+     */
+    private fun checkEnvironment() {
+        if (checkingEnvironment) {
+            return
+        }
+        checkingEnvironment = true
+        rootGranted = null
+        scopeState = null
+        refreshTargetState()
+        Thread {
+            val root = ConfigStore.rootGranted()
+            // Without root neither the framework database nor the launcher's
+            // memory map can be read, so no scope can be active.
+            val scope = if (root) {
+                ConfigStore.scopeState(this@MainActivity)
+            } else {
+                ConfigStore.ScopeState.Disabled
+            }
+            runOnUiThread {
+                if (isFinishing || isDestroyed) {
+                    return@runOnUiThread
+                }
+                checkingEnvironment = false
+                rootGranted = root
+                scopeState = scope
+                refreshTargetState()
+            }
+        }.start()
     }
 
     private fun buildUi(): View {
@@ -75,7 +115,7 @@ class MainActivity : Activity() {
             setTypeface(typeface, Typeface.BOLD)
         })
         root.addView(TextView(this).apply {
-            text = "五个开关互相独立，默认关闭。切换后会原子写入 JSON；重启桌面后整份配置生效，并在该桌面进程内保持不变。"
+            text = "使用方法：授予该应用root权限并在LSPosed内启用该模块。回到本应用后勾选需要启用的功能并点击重启桌面按钮。"
             textSize = 14f
             setTextColor(Color.rgb(96, 102, 112))
             setPadding(0, dp(6), 0, dp(12))
@@ -91,8 +131,8 @@ class MainActivity : Activity() {
 
         addSwitch(
             root,
-            title = "隐藏抽屉“全部”标签",
-            description = "从抽屉分类列表移除“全部”，保留自定义标签；打开抽屉直接显示第一个自定义标签。",
+            title = "隐藏“全部”标签页",
+            description = "从抽屉模式的标签栏中移除“全部”标签，并将进入抽屉模式的首页面改为首个自定义标签页。",
             checked = config.hideDrawerAllTab,
         ) { checked ->
             config = config.copy(hideDrawerAllTab = checked)
@@ -100,8 +140,8 @@ class MainActivity : Activity() {
         }
         addSwitch(
             root,
-            title = "隐藏桌面编辑按钮",
-            description = "长按桌面进入编辑模式时，隐藏右上角/底部的编辑入口。",
+            title = "隐藏编辑按钮",
+            description = "隐藏排列在每个标签页最后一位的编辑按钮。",
             checked = config.hideEditButton,
         ) { checked ->
             config = config.copy(hideEditButton = checked)
@@ -109,8 +149,8 @@ class MainActivity : Activity() {
         }
         addSwitch(
             root,
-            title = "隐藏桌面设置齿轮",
-            description = "隐藏桌面设置入口（齿轮图标）。",
+            title = "隐藏设置齿轮",
+            description = "隐藏位于抽屉模式标签栏最右侧的设置齿轮。",
             checked = config.hideSettingsGear,
         ) { checked ->
             config = config.copy(hideSettingsGear = checked)
@@ -119,7 +159,7 @@ class MainActivity : Activity() {
         addSwitch(
             root,
             title = "隐藏搜索框",
-            description = "桌面与抽屉的搜索框返回空 Widget。",
+            description = "隐藏抽屉模式位于每个标签页下方的应用搜索框。",
             checked = config.hideSearchBox,
         ) { checked ->
             config = config.copy(hideSearchBox = checked)
@@ -128,31 +168,20 @@ class MainActivity : Activity() {
         addSwitch(
             root,
             title = "隐藏上滑箭头",
-            description = "应用抽屉的上滑提示箭头返回 false。",
+            description = "隐藏手机主页下方用于引导进入抽屉模式的上滑箭头。",
             checked = config.hideSwipeUpArrow,
         ) { checked ->
             config = config.copy(hideSwipeUpArrow = checked)
             persist()
         }
-        root.addView(TextView(this).apply {
-            text = "写入位置（桌面会读取最新的有效文件）：\n" +
-                "1. /data/user/<user>/com.miui.home/files/miuihome_edit.json\n" +
-                "2. /storage/emulated/<user>/Android/data/com.miui.home/files/miuihome_edit.json\n" +
-                "3. /storage/emulated/<user>/MiuiHomeEdit/miuihome_edit.json（无 Root 备用）"
-            textSize = 11f
-            setTextColor(Color.rgb(110, 116, 128))
-            setTypeface(Typeface.MONOSPACE)
-            setPadding(0, dp(14), 0, 0)
-        }, matchWidth())
-
         allFilesButton = Button(this).apply {
-            text = "授予“所有文件访问”（无 Root 时的备用）"
+            text = "授予“所有文件访问权限”（无 Root 时的备用）"
             setOnClickListener { ConfigStore.requestAllFilesAccess(this@MainActivity) }
         }
         root.addView(allFilesButton, matchWidth(top = 14))
 
         restartButton = Button(this).apply {
-            text = "重启 com.miui.home"
+            text = "重启桌面"
             setOnClickListener { restartLauncher() }
         }
         root.addView(restartButton, matchWidth(top = 8))
@@ -171,7 +200,7 @@ class MainActivity : Activity() {
         root.addView(copyDiagnosticsButton, matchWidth(top = 8))
 
         exportDiagnosticsButton = Button(this).apply {
-            text = "导出诊断报告…"
+            text = "导出诊断报告"
             isEnabled = false
             setOnClickListener { exportDiagnostics() }
         }
@@ -360,18 +389,27 @@ class MainActivity : Activity() {
 
 
     private fun refreshTargetState(report: ConfigStore.SaveReport? = null) {
-        val installed = ConfigStore.targetInstalled(this)
-        val root = when {
-            report == null -> "保存配置时检测"
-            report.rootAvailable -> "可用"
-            else -> "不可用"
+        // A finished save is itself a root query: reuse its answer instead of
+        // starting another su round-trip.
+        if (report != null) {
+            rootGranted = report.rootAvailable
+        }
+        val root = when (rootGranted) {
+            true -> "已授予"
+            false -> "未授予"
+            null -> "检测中…"
         }
         val allFiles = if (ConfigStore.allFilesAccessGranted()) "已授予" else "未授予"
-        targetView.text = "目标应用：com.miui.home ${if (installed) "已安装" else "未找到"}\n" +
-            "Android：${Build.VERSION.RELEASE}（SDK ${Build.VERSION.SDK_INT}，" +
+        val scope = when (scopeState) {
+            ConfigStore.ScopeState.Enabled -> "已启用"
+            ConfigStore.ScopeState.Disabled -> "未启用"
+            null -> "检测中…"
+        }
+        targetView.text = "Android：${Build.VERSION.RELEASE}（SDK ${Build.VERSION.SDK_INT}，" +
             "${Build.SUPPORTED_ABIS.firstOrNull() ?: "?"}）\n" +
             "Root：$root\n" +
-            "所有文件访问：$allFiles"
+            "所有文件访问权限：$allFiles\n" +
+            "LSPosed作用域：$scope"
         allFilesButton?.visibility =
             if (ConfigStore.allFilesAccessGranted()) View.GONE else View.VISIBLE
     }
